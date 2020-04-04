@@ -949,9 +949,14 @@ TUint DriverAlsa::PipelineAnimatorDelayJiffies(AudioFormat aFormat,
     return iPimpl->DriverDelayJiffies(aSampleRate);
 }
 
-TUint DriverAlsa::PipelineAnimatorDsdBlockSizeBytes() const
+TUint DriverAlsa::PipelineAnimatorDsdBlockSizeWords() const
 {
 	return 0;
+}
+
+TUint DriverAlsa::PipelineAnimatorMaxBitDepth() const
+{
+	return 24;
 }
 
 Msg* DriverAlsa::ProcessMsg(MsgHalt* aMsg)

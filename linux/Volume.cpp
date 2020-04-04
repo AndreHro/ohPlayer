@@ -73,6 +73,11 @@ TBool VolumeProfile::AlwaysOn() const
     return kAlwaysOn;
 }
 
+IVolumeProfile::StartupVolume VolumeProfile::StartupVolumeConfig() const
+{
+    return IVolumeProfile::StartupVolume::Both;
+}
+
 VolumeControl::VolumeControl()
 {
     const TChar *CARD          = "default";

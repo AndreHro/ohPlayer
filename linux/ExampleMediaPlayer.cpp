@@ -59,6 +59,8 @@ ExampleMediaPlayer::ExampleMediaPlayer(Net::DvStack& aDvStack,
     iShellDebug = new ShellCommandDebug(*iShell);
     iInfoLogger = new Media::AllocatorInfoLogger();
 
+    const Brn kFriendlyNamePrefix("OpenHome ");
+
     // Do NOT set UPnP friendly name attributes at this stage.
     // (Wait until MediaPlayer is created so that friendly name can be
     // observed.)
@@ -115,7 +117,7 @@ ExampleMediaPlayer::ExampleMediaPlayer(Net::DvStack& aDvStack,
     iInitParams->SetGorgerDuration(iInitParams->DecodedReservoirJiffies());
 
     // create MediaPlayer
-    auto mpInit = MediaPlayerInitParams::New(Brn(aRoom), Brn(aProductName));
+    auto mpInit = MediaPlayerInitParams::New(Brn(aRoom), Brn(aProductName),kFriendlyNamePrefix);
     iMediaPlayer = new MediaPlayer( aDvStack, aCpStack, *iDevice, *iRamStore,
                                    *iConfigStore, iInitParams,
                                     volumeInit, volumeProfile, *iInfoLogger,
@@ -132,7 +134,7 @@ ExampleMediaPlayer::ExampleMediaPlayer(Net::DvStack& aDvStack,
                                         *iDevice);
 
     iFnManagerUpnpAv = new
-        Av::FriendlyNameManagerUpnpAv(iMediaPlayer->Product());
+        Av::FriendlyNameManagerUpnpAv(kFriendlyNamePrefix,iMediaPlayer->Product());
 
     iFnUpdaterUpnpAv = new
         Av::FriendlyNameAttributeUpdater(*iFnManagerUpnpAv,
@@ -301,12 +303,13 @@ void ExampleMediaPlayer::RegisterPlugins(Environment& aEnv)
     iMediaPlayer->Add(Codec::CodecFactory::NewVorbis(iMediaPlayer->MimeTypes()));
 
     // Add protocol modules
-    iMediaPlayer->Add(ProtocolFactory::NewHttp(aEnv, iUserAgent));
-    iMediaPlayer->Add(ProtocolFactory::NewHttp(aEnv, iUserAgent));
-    iMediaPlayer->Add(ProtocolFactory::NewHttp(aEnv, iUserAgent));
-    iMediaPlayer->Add(ProtocolFactory::NewHttp(aEnv, iUserAgent));
-    iMediaPlayer->Add(ProtocolFactory::NewHttp(aEnv, iUserAgent));
-    iMediaPlayer->Add(ProtocolFactory::NewHls(aEnv, iUserAgent));
+    auto& ssl = iMediaPlayer->Ssl();
+    iMediaPlayer->Add(ProtocolFactory::NewHttp(aEnv, ssl, iUserAgent));
+    iMediaPlayer->Add(ProtocolFactory::NewHttp(aEnv, ssl, iUserAgent));
+    iMediaPlayer->Add(ProtocolFactory::NewHttp(aEnv, ssl, iUserAgent));
+    iMediaPlayer->Add(ProtocolFactory::NewHttp(aEnv, ssl, iUserAgent));
+    iMediaPlayer->Add(ProtocolFactory::NewHttp(aEnv, ssl, iUserAgent));
+    iMediaPlayer->Add(ProtocolFactory::NewHls(aEnv, ssl, iUserAgent));
 
     // Add sources
     iMediaPlayer->Add(SourceFactory::NewPlaylist(*iMediaPlayer,Optional<IPlaylistLoader>(nullptr)));
@@ -324,6 +327,7 @@ void ExampleMediaPlayer::RegisterPlugins(Environment& aEnv)
     // You must define your Tidal token
     iMediaPlayer->Add(ProtocolFactory::NewTidal(
                                             aEnv,
+					    ssl,
                                             Brn(TIDAL_TOKEN),
                                             *iMediaPlayer));
 #endif  // ENABLE_TIDAL
