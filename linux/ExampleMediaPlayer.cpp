@@ -58,7 +58,7 @@ ExampleMediaPlayer::ExampleMediaPlayer(Net::DvStack& aDvStack,
     iShell = new Shell(aDvStack.Env(), kShellPort);
     iShellDebug = new ShellCommandDebug(*iShell);
     iInfoLogger = new Media::AllocatorInfoLogger();
-
+    
     const Brn kFriendlyNamePrefix("OpenHome ");
 
     // Do NOT set UPnP friendly name attributes at this stage.
@@ -304,11 +304,10 @@ void ExampleMediaPlayer::RegisterPlugins(Environment& aEnv)
 
     // Add protocol modules
     auto& ssl = iMediaPlayer->Ssl();
-    iMediaPlayer->Add(ProtocolFactory::NewHttp(aEnv, ssl, iUserAgent));
-    iMediaPlayer->Add(ProtocolFactory::NewHttp(aEnv, ssl, iUserAgent));
-    iMediaPlayer->Add(ProtocolFactory::NewHttp(aEnv, ssl, iUserAgent));
-    iMediaPlayer->Add(ProtocolFactory::NewHttp(aEnv, ssl, iUserAgent));
-    iMediaPlayer->Add(ProtocolFactory::NewHttp(aEnv, ssl, iUserAgent));
+    static const TUint kNumHttpProtocols = 5;
+    for (TUint i=0; i<kNumHttpProtocols; i++) {
+        iMediaPlayer->Add(ProtocolFactory::NewHttp(aEnv, ssl, iUserAgent));
+    }
     iMediaPlayer->Add(ProtocolFactory::NewHls(aEnv, ssl, iUserAgent));
 
     // Add sources
@@ -327,7 +326,7 @@ void ExampleMediaPlayer::RegisterPlugins(Environment& aEnv)
     // You must define your Tidal token
     iMediaPlayer->Add(ProtocolFactory::NewTidal(
                                             aEnv,
-					    ssl,
+                                            ssl,
                                             Brn(TIDAL_TOKEN),
                                             *iMediaPlayer));
 #endif  // ENABLE_TIDAL

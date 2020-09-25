@@ -138,7 +138,7 @@ private:
             void NotifyMode(const Brx& aMode,
                             const Media::ModeInfo& aInfo,
 							const Media::ModeTransportControls& aTransportControls) override;
-            void NotifyTrack(Media::Track& aTrack,
+            void NotifyTrack(Media::Track& aTrack, 
                              TBool aStartOfStream) override;
             void NotifyMetaText(const Brx& aText) override;
             void NotifyTime(TUint aSeconds) override;
