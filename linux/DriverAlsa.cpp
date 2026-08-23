@@ -1,11 +1,11 @@
+#include "DriverAlsa.h"
+#include "SoxrProcessor.h"
+#include "IDataSink.h"
 #include "OhLog.h"
-#include <OpenHome/Private/Printer.h>
-#include <OpenHome/Net/Private/Globals.h>
-#include <OpenHome/OsWrapper.h>
+
 #include <alsa/asoundlib.h>
 #include <memory>
 
-#include "DriverAlsa.h"
 
 using namespace OpenHome;
 using namespace OpenHome::Media;
@@ -37,528 +37,7 @@ TUint PriorityArbitratorDriver::HostRange() const
     return 1;
 }
 
-class IDataSink
-{
-public:
-    virtual void Write(const Brx& aData) = 0;
-    virtual     ~IDataSink() {}
-};
-
-// PcmProcessorBase
-
-class PcmProcessorBase : public IPcmProcessor
-{
-protected:
-    PcmProcessorBase(IDataSink& aDataSink, Bwx& aBuffer);
-public: // IPcmProcessor
-    virtual void BeginBlock() override;
-    void ProcessFragment(const Brx& aData, TUint aNumChannels, TUint aSubsampleBytes) override;
-    void ProcessSilence(const Brx& aData, TUint aNumChannels, TUint aSubsampleBytes) override;
-    virtual void EndBlock() override;
-    virtual void Flush() override;
-public:
-    void SetDuplicateChannel(TBool duplicateChannel);
-    void SetBitDepth(TUint bitDepth);
-protected:
-    void Append(const TByte* aData, TUint aBytes);
-
-    virtual void ProcessFragment8(const Brx& aData, TUint aNumChannels) = 0;
-    virtual void ProcessFragment16(const Brx& aData, TUint aNumChannels) = 0;
-    virtual void ProcessFragment24(const Brx& aData, TUint aNumChannels) = 0;
-    virtual void ProcessFragment32(const Brx& aData, TUint aNumChannels) = 0;
-protected:
-    IDataSink& iSink;
-    Bwx&       iBuffer;
-    TBool      iDuplicateChannel;
-    TUint      iBitDepth;
-};
-
-PcmProcessorBase::PcmProcessorBase(IDataSink& aDataSink, Bwx& aBuffer)
-: iSink(aDataSink)
-, iBuffer(aBuffer)
-, iDuplicateChannel(false)
-, iBitDepth(0)
-{
-}
-
-void PcmProcessorBase::SetDuplicateChannel(TBool duplicateChannel)
-{
-    iDuplicateChannel = duplicateChannel;
-}
-
-void PcmProcessorBase::SetBitDepth(TUint bitDepth)
-{
-    iBitDepth = bitDepth;
-}
-
-void PcmProcessorBase::Append(const TByte* aData, TUint aBytes)
-{
-    if (iBuffer.BytesRemaining() < aBytes)
-        Flush();
-
-    iBuffer.Append(aData, aBytes);
-}
-
-void PcmProcessorBase::Flush()
-{
-    if (iBuffer.Bytes() != 0)
-    {
-        iSink.Write(iBuffer);
-        iBuffer.SetBytes(0);
-    }
-}
-
-void PcmProcessorBase::BeginBlock()
-{
-    ASSERT(iBuffer.Bytes() == 0);
-}
-
-void PcmProcessorBase::EndBlock()
-{
-    Flush();
-}
-
-void PcmProcessorBase::ProcessSilence(const Brx& aData, 
-                                      TUint aNumChannels,
-                                      TUint aNumSampleBytes)
-{
-    ProcessFragment(aData, aNumChannels, aNumSampleBytes);
-}
-
-void PcmProcessorBase::ProcessFragment(const Brx& aData,
-                                       TUint aNumChannels,
-                                       TUint /*aNumSampleBytes*/)
-{
-    switch (iBitDepth)
-    {
-        case 8: {
-            ProcessFragment8(aData, aNumChannels);
-            break;
-        }
-        case 16: {
-            ProcessFragment16(aData, aNumChannels);
-            break;
-        }
-        case 24: {
-            ProcessFragment24(aData, aNumChannels);
-            break;
-        }
-        case 32: {
-            ProcessFragment32(aData, aNumChannels);
-            break;
-        }
-        default: {
-            ASSERT_VA(false, "%s", "Unknown bit depth.");
-            break; // NOT REACHED
-        }
-    }
-
-}
-
-
-// PcmProcessorLe
-
-class PcmProcessorLe : public PcmProcessorBase
-{
-public:
-    PcmProcessorLe(IDataSink& aSink, Bwx& aBuffer);
-public: // IPcmProcessor
-    virtual void ProcessFragment8(const Brx& aData, TUint aNumChannels);
-    virtual void ProcessFragment16(const Brx& aData, TUint aNumChannels);
-    virtual void ProcessFragment24(const Brx& aData, TUint aNumChannels);
-    virtual void ProcessFragment32(const Brx& aData, TUint aNumChannels);
-};
-
-PcmProcessorLe::PcmProcessorLe(IDataSink& aSink, Bwx& aBuffer)
-: PcmProcessorBase(aSink, aBuffer)
-{
-}
-
-void PcmProcessorLe::ProcessFragment8(const Brx& aData, TUint aNumChannels)
-{
-    TByte *nData;
-    TUint  bytes;
-
-    // The input data is converted from unsigned 8 bit to signed 16 bit.
-    // to removes poor audio quality and glitches when part of a playlist
-    // with tracks of a different bit depth.
-    //
-    // Accordingly the amount of data is doubled.
-    bytes = aData.Bytes() * 2;
-
-    // If we are manually converting mono to stereo the data will double.
-    if (iDuplicateChannel)
-    {
-        bytes *= 2;
-    }
-
-    nData = new TByte[bytes];
-    ASSERT(nData != NULL);
-
-    TByte *ptr  = (TByte *)(aData.Ptr() + 0);
-    TByte *ptr1 = (TByte *)nData;
-    TByte *endp = ptr1 + bytes;
-
-    while (ptr1 < endp)
-    {
-        // Convert U8 to S16 data in little endian format.
-        *ptr1++ = 0x00;
-        *ptr1++ = *ptr - 0x80;
-
-        if (iDuplicateChannel)
-        {
-            *ptr1++ = 0x00;
-            *ptr1++ = *ptr - 0x80;
-        }
-
-        ptr++;
-    }
-
-    Brn fragment(nData, bytes);
-    Flush();
-    iSink.Write(fragment);
-    delete[] nData;
-}
-
-void PcmProcessorLe::ProcessFragment16(const Brx& aData, TUint aNumChannels)
-{
-    TByte *nData;
-    TUint  bytes;
-
-    bytes = aData.Bytes();
-
-    // If we are manually converting mono to stereo the data will double.
-    if (iDuplicateChannel)
-    {
-        bytes *= 2;
-    }
-
-    nData = new TByte[bytes];
-    ASSERT(nData != NULL);
-
-    TByte *ptr  = (TByte *)(aData.Ptr() + 0);
-    TByte *ptr1 = (TByte *)nData;
-    TByte *endp = ptr1 + bytes;
-
-    ASSERT(bytes % 2 == 0);
-
-    while (ptr1 < endp)
-    {
-        // Store the S16 data in little endian format.
-        *ptr1++ = *(ptr+1);
-        *ptr1++ = *(ptr);
-
-        if (iDuplicateChannel)
-        {
-            *ptr1++ = *(ptr+1);
-            *ptr1++ = *(ptr);
-        }
-
-        ptr +=2;
-    }
-
-    Brn fragment(nData, bytes);
-    Flush();
-    iSink.Write(fragment);
-    delete[] nData;
-}
-
-void PcmProcessorLe::ProcessFragment24(const Brx& aData, TUint aNumChannels)
-{
-    TByte *nData;
-    TUint  bytes;
-
-    // 24 bit audio is not supported on the platform so it is converted
-    // to signed 16 bit audio for playback.
-    //
-    // Accordingly one third of the input data is discarded.
-    bytes = (aData.Bytes() * 2) / 3;
-
-    // If we are manually converting mono to stereo the data will double.
-    if (iDuplicateChannel)
-    {
-        bytes *= 2;
-    }
-
-    nData = new TByte[bytes];
-    ASSERT(nData != NULL);
-
-    TByte *ptr  = (TByte *)(aData.Ptr() + 0);
-    TByte *ptr1 = (TByte *)nData;
-    TByte *endp = ptr1 + bytes;
-
-    ASSERT(bytes % 2 == 0);
-
-    while (ptr1 < endp)
-    {
-        // Store the data in little endian format.
-        *ptr1++ = *(ptr+1);
-        *ptr1++ = *(ptr+0);
-
-        if (iDuplicateChannel)
-        {
-            *ptr1++ = *(ptr+1);
-            *ptr1++ = *(ptr+0);
-        }
-
-        ptr += 3;
-    }
-
-    Brn fragment(nData, bytes);
-    Flush();
-    iSink.Write(fragment);
-    delete[] nData;
-}
-
-void PcmProcessorLe::ProcessFragment32(const Brx& aData, TUint aNumChannels)
-{
-    TByte *nData;
-    TUint  bytes;
-
-    // Currently the only 32 bit pcm in the pipeline is auto-generated by
-    // the ramper.
-    //
-    // This may differ from the stream format so we must do the conversion
-    // here.
-    bytes = aData.Bytes();
-
-    // If we are manually converting mono to stereo the data will double.
-    //
-    // aNumChannels must be checked as the ramper can inject 32 bit
-    // stereo into the pipeline.
-    if (iDuplicateChannel && (aNumChannels != 2))
-    {
-        bytes *= 2;
-    }
-
-    nData = new TByte[bytes];
-    ASSERT(nData != NULL);
-
-    TByte *ptr  = (TByte *)(aData.Ptr() + 0);
-    TByte *endp = ptr + aData.Bytes();
-    TByte *ptr1 = (TByte *)nData;
-
-    TUint outBytes = 0;
-
-    while (ptr < endp)
-    {
-        switch (iBitDepth)
-        {
-            // The system only supports upto 16 bit.
-            //
-            // Convert everything above that to 16 bit.
-            case 32:
-            // Fallthrough
-            case 24:
-            // Fallthrough
-            case 16:
-            {
-                // Store the data in little endian format.
-                *ptr1++ = *(ptr+1);
-                *ptr1++ = *(ptr+0);
-                outBytes += 2;
-
-                if (iDuplicateChannel && (aNumChannels != 2))
-                {
-                    *ptr1++ = *(ptr+1);
-                    *ptr1++ = *(ptr+0);
-                    outBytes += 2;
-                }
-
-                break;
-            }
-            // The platform is configured for 8 bit. Convert.
-            case 8:
-            {
-                *ptr1++ = *(ptr+0);
-                outBytes += 1;
-
-                if (iDuplicateChannel && (aNumChannels != 2))
-                {
-                    *ptr1++ = *(ptr+0);
-                    outBytes += 1;
-                }
-
-                break;
-            }
-        }
-
-        ptr += 4;
-    }
-
-    Brn fragment(nData, outBytes);
-    Flush();
-    iSink.Write(fragment);
-    delete[] nData;
-}
-
-// PcmProcessorLe32
-
-class PcmProcessorLe32 : public PcmProcessorLe
-{
-public:
-    PcmProcessorLe32(IDataSink& aSink, Bwx& aBuffer);
-public: // IPcmProcessor
-    void ProcessFragment24(const Brx& aData, TUint aNumChannels);
-    void ProcessFragment32(const Brx& aData, TUint aNumChannels);
-};
-
-PcmProcessorLe32::PcmProcessorLe32(IDataSink& aSink, Bwx& aBuffer)
-: PcmProcessorLe(aSink, aBuffer)
-{
-}
-
-void PcmProcessorLe32::ProcessFragment24(const Brx& aData, TUint aNumChannels)
-{
-    TByte *nData;
-    TUint  bytes;
-
-    // 24 bit audio is not supported on the platform so it is converted
-    // to signed 32 bit audio for playback.
-    //
-    // Accordingly we allocate room for 4 byte samples.
-    bytes = (aData.Bytes() * 4) / 3;
-
-    // If we are manually converting mono to stereo the data will double.
-    if (iDuplicateChannel)
-    {
-        bytes *= 2;
-    }
-
-    nData = new TByte[bytes];
-    ASSERT(nData != NULL);
-
-    TByte *ptr  = (TByte *)(aData.Ptr() + 0);
-    TByte *ptr1 = (TByte *)nData;
-    TByte *endp = ptr1 + bytes;
-
-    ASSERT(bytes % 4 == 0);
-
-    while (ptr1 < endp)
-    {
-        // Store the data in little endian format.
-        *ptr1++ = 0;
-        *ptr1++ = *(ptr+2);
-        *ptr1++ = *(ptr+1);
-        *ptr1++ = *(ptr+0);
-
-        if (iDuplicateChannel)
-        {
-            *ptr1++ = 0;
-            *ptr1++ = *(ptr+2);
-            *ptr1++ = *(ptr+1);
-            *ptr1++ = *(ptr+0);
-        }
-
-        ptr += 3;
-    }
-
-    Brn fragment(nData, bytes);
-    Flush();
-    iSink.Write(fragment);
-    delete[] nData;
-}
-
-void PcmProcessorLe32::ProcessFragment32(const Brx& aData, TUint aNumChannels)
-{
-    TByte *nData;
-    TUint  bytes;
-
-    // Currently the only 32 bit pcm in the pipeline is auto-generated by
-    // the ramper.
-    //
-    // This may differ from the stream format so we must do the conversion
-    // here.
-    bytes = aData.Bytes();
-
-    // If we are manually converting mono to stereo the data will double.
-    //
-    // aNumChannels must be checked as the ramper can inject 32 bit
-    // stereo into the pipeline.
-    if (iDuplicateChannel && (aNumChannels != 2))
-    {
-        bytes *= 2;
-    }
-
-    nData = new TByte[bytes];
-    ASSERT(nData != NULL);
-
-    TByte *ptr  = (TByte *)(aData.Ptr() + 0);
-    TByte *endp = ptr + aData.Bytes();
-    TByte *ptr1 = (TByte *)nData;
-
-    TUint outBytes = 0;
-
-    while (ptr < endp)
-    {
-        switch (iBitDepth)
-        {
-            // The platform supports and is configured for 32 bit audio.
-            case 32:
-            // Fallthrough
-            case 24:
-            {
-                *ptr1++ = *(ptr+3);
-                *ptr1++ = *(ptr+2);
-                *ptr1++ = *(ptr+1);
-                *ptr1++ = *(ptr+0);
-                outBytes += 4;
-
-                if (iDuplicateChannel && (aNumChannels != 2))
-                {
-                    *ptr1++ = *(ptr+3);
-                    *ptr1++ = *(ptr+2);
-                    *ptr1++ = *(ptr+1);
-                    *ptr1++ = *(ptr+0);
-                    outBytes += 4;
-                }
-
-                break;
-            }
-            // The platform is configured for 16 bit. Convert.
-            case 16:
-            {
-                *ptr1++ = *(ptr+1);
-                *ptr1++ = *(ptr+0);
-                outBytes += 2;
-
-                if (iDuplicateChannel && (aNumChannels != 2))
-                {
-                    *ptr1++ = *(ptr+1);
-                    *ptr1++ = *(ptr+0);
-                    outBytes += 2;
-                }
-
-                break;
-            }
-            // The platform is configured for 8 bit. Convert.
-            case 8:
-            {
-                *ptr1++ = *(ptr+1);
-                *ptr1++ = *(ptr+0);
-                outBytes += 2;
-
-                if (iDuplicateChannel && (aNumChannels != 2))
-                {
-                    *ptr1++ = *(ptr+1);
-                    *ptr1++ = *(ptr+0);
-                    outBytes += 2;
-                }
-
-                break;
-            }
-        }
-
-        ptr += 4;
-    }
-
-    Brn fragment(nData, outBytes);
-    Flush();
-    iSink.Write(fragment);
-    delete[] nData;
-}
-
-typedef std::pair<snd_pcm_format_t, TUint> OutputFormat;
+using OutputFormat=std::pair<snd_pcm_format_t, TUint>;
 
 class Profile
 {
@@ -657,20 +136,19 @@ DriverAlsa::Pimpl::Pimpl(const TChar* aAlsaDevice, TUint aBufferUs)
 {
     auto err = snd_pcm_open(&iHandle, aAlsaDevice, SND_PCM_STREAM_PLAYBACK, 0);
     ASSERT(err == 0);
+    AudioSpec initialSpec{};
+    initialSpec.iSampleBytes = 4;
+    initialSpec.iNumChannels = 2;
+    initialSpec.iBitDepth = 32;
+    initialSpec.iInputRate = 44100.0;
+    initialSpec.iOutputRate = 44100.0;
 
-    // PcmProcessorLe with S32 support
-    iProfiles.emplace_back(new PcmProcessorLe32(*this, iSampleBuffer),
-            OutputFormat(SND_PCM_FORMAT_S32_LE, 4),  // S32 -> S32
-            OutputFormat(SND_PCM_FORMAT_S32_LE, 4),  // S24 -> S32
-            OutputFormat(SND_PCM_FORMAT_S16_LE, 2),  // S16
-            OutputFormat(SND_PCM_FORMAT_S16_LE, 2)); // U8 -> S16
-
-    // PcmProcessorLe without S32 support
-    iProfiles.emplace_back(new PcmProcessorLe(*this, iSampleBuffer),
-            OutputFormat(SND_PCM_FORMAT_S16_LE, 2),  // S32 -> S16
-            OutputFormat(SND_PCM_FORMAT_S16_LE, 2),  // S24 -> S16
-            OutputFormat(SND_PCM_FORMAT_S16_LE, 2),  // S16
-            OutputFormat(SND_PCM_FORMAT_S16_LE, 2)); // U8 -> S16
+    iProfiles.emplace_back(
+        new SoxrPcmProcessor(*this, iSampleBuffer, initialSpec),
+        OutputFormat(SND_PCM_FORMAT_S32_LE, 4),
+        OutputFormat(SND_PCM_FORMAT_S32_LE, 4),
+        OutputFormat(SND_PCM_FORMAT_S32_LE, 4),
+        OutputFormat(SND_PCM_FORMAT_S32_LE, 4));
 }
 
 DriverAlsa::Pimpl::~Pimpl()
@@ -690,7 +168,7 @@ void DriverAlsa::Pimpl::ProcessDrain()
     // Wait for the native audio buffers to empty.
     if (iProfileIndex != -1)
     {
-        // Drain the PCM buffers.
+        iProfiles[iProfileIndex].GetPcmProcessor().EndBlock();
         auto err = snd_pcm_drain(iHandle);
         if (err < 0)
         {
@@ -875,22 +353,31 @@ void DriverAlsa::Pimpl::ProcessDecodedStream(MsgDecodedStream* aMsg)
                        decodedStreamInfo.SampleRate(), iBufferUs))
         {
             iProfileIndex = i;
+            SoxrPcmProcessor& pcmProcessor =
+                    static_cast<SoxrPcmProcessor&>(
+                        iProfiles[i].GetPcmProcessor());
 
-            PcmProcessorBase& pcmP =
-                (PcmProcessorBase&)iProfiles[i].GetPcmProcessor();
-            pcmP.SetDuplicateChannel(iDuplicateChannel);
-            pcmP.SetBitDepth(decodedStreamInfo.BitDepth());
+            AudioSpec spec{};
+            spec.iSampleBytes =
+                decodedStreamInfo.BitDepth() == 8 ? 1 :
+                decodedStreamInfo.BitDepth() == 16 ? 2 :
+                decodedStreamInfo.BitDepth() == 24 ? 3 : 4;
+            spec.iNumChannels = decodedStreamInfo.NumChannels();
+            spec.iBitDepth = decodedStreamInfo.BitDepth();
+            spec.iInputRate = decodedStreamInfo.SampleRate();
+            spec.iOutputRate = decodedStreamInfo.SampleRate();
 
-            iSampleBytes =
-                decodedStreamInfo.NumChannels() *
-                iProfiles[i].GetFormat(decodedStreamInfo.BitDepth()).second;
+            pcmProcessor.SetDuplicateChannel(iDuplicateChannel);
+            pcmProcessor.UpdateFormatSpec(spec);
 
-            // If we manually converting mono to stereo the sample size doubles.
-            if (iDuplicateChannel)
-            {
-                iSampleBytes *= 2;
-            }
+            const OutputFormat outputFormat =
+            iProfiles[i].GetFormat(spec.iBitDepth);
 
+            const TUint outputChannels =
+                (iDuplicateChannel && spec.iNumChannels == 1) ? 2 :
+                spec.iNumChannels;
+
+            iSampleBytes = outputChannels * outputFormat.second;
             iDitch = false;
 
             Log::Print("Found PcmProcessor %d\n", iProfileIndex);
@@ -915,9 +402,6 @@ TBool DriverAlsa::Pimpl::TryProfile(Profile& aProfile,
 {
     auto outputFormat = aProfile.GetFormat(aBitDepth);
 
-    if (iDuplicateChannel) {
-        aNumChannels *= 2;
-    }
 
     snd_pcm_hw_params_t* hwParams;
     snd_pcm_sw_params_t* swParams;
@@ -935,9 +419,17 @@ TBool DriverAlsa::Pimpl::TryProfile(Profile& aProfile,
                                        outputFormat.first);
     if (err < 0) return false;
 
-    err = snd_pcm_hw_params_set_channels(iHandle, hwParams,
-                                         aNumChannels);
-    if (err < 0) return false;
+    const TUint outputChannels =
+    (iDuplicateChannel && aNumChannels == 1) ? 2 :
+    aNumChannels;
+
+    err = snd_pcm_hw_params_set_channels(
+        iHandle,
+        hwParams,
+        outputChannels);
+    if (err < 0) {
+        return false;
+    }
 
     unsigned int rate = aSampleRate;
     err = snd_pcm_hw_params_set_rate_near(iHandle, hwParams, &rate, nullptr);
@@ -992,12 +484,12 @@ TBool DriverAlsa::Pimpl::TryProfile(Profile& aProfile,
     if (err < 0) return false;
 
     Log::Print("DriverAlsa: configured ALSA: rate=%u channels=%u "
-               "format=%d buffer=%lu frames period=%lu frames\n",
-               rate,
-               aNumChannels,
-               outputFormat.first,
-               bufferSize,
-               periodSize);
+           "format=%d buffer=%lu frames period=%lu frames\n",
+           rate,
+           outputChannels,
+           outputFormat.first,
+           bufferSize,
+           periodSize);
 
     return true;
 }
