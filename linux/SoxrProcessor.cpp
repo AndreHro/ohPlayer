@@ -1,18 +1,20 @@
 #include "SoxrProcessor.h"
 #include "IDataSink.h"
 #include <OpenHome/Private/Printer.h>
+
 #include <soxr.h>
-
-
 #include <cmath>
 #include <cstring>
 #include <memory>
 #include <vector>
 #include <algorithm>
 
-
 using namespace OpenHome;
 using namespace OpenHome::Media;
+
+namespace {
+    constexpr TUint kOutputSampleBytes = sizeof(TInt32);
+}
 
 class SoxrPcmProcessor::SoxrPcmProcPimpl
 {
@@ -32,12 +34,16 @@ public:
     soxr_datatype_t GetInputType() const { return iInputType; }
 
 private:
+
+    void WriteMonoAsStereo(const TByte* aSource, size_t aFrames);
+
     IDataSink&      iSink;
     soxr_t          iInstance;
     soxr_error_t    iError;
     AudioSpec       iSpec;
     soxr_datatype_t iInputType;
-    TUint           iTargetChannels;
+    TBool           iDuplicateMono;
+    std::vector<TByte> iStereoBuffer;
 };
 
 SoxrPcmProcessor::SoxrPcmProcPimpl::SoxrPcmProcPimpl(IDataSink& aDataSink, const AudioSpec& aSpec, soxr_datatype_t aInputType, bool aDuplicateChannel)
@@ -46,7 +52,7 @@ SoxrPcmProcessor::SoxrPcmProcPimpl::SoxrPcmProcPimpl(IDataSink& aDataSink, const
 , iError(nullptr)
 , iSpec(aSpec)
 , iInputType(aInputType)
-, iTargetChannels(0)
+, iDuplicateMono(aSpec.iNumChannels == 1 && aDuplicateChannel)
 {
     // Guard against zero division errors if an invalid spec leaks through
     if (iSpec.iInputRate <= 0.0)  iSpec.iInputRate = 44100.0;
@@ -56,30 +62,22 @@ SoxrPcmProcessor::SoxrPcmProcPimpl::SoxrPcmProcPimpl(IDataSink& aDataSink, const
     soxr_io_spec_t ioSpec = soxr_io_spec(iInputType, SOXR_INT32_I);
     soxr_quality_spec_t qSpec = soxr_quality_spec(SOXR_HQ, 0);
 
-    if (iSpec.iNumChannels == 1 && aDuplicateChannel) {
-        iTargetChannels = 2;
-    }
-    else {
-        iTargetChannels = iSpec.iNumChannels;
-    }
-
+    // Maintain symmetric channel topology natively requested by the stream
+    // If input is mono, libsoxr processes it as pure 1-channel mono
     iInstance = soxr_create(
         iSpec.iInputRate,
         iSpec.iOutputRate,
-        iTargetChannels,
+        iSpec.iNumChannels,
         &iError,
         &ioSpec,
         &qSpec,
-        nullptr);;
+        nullptr);
 
     if (iError || !iInstance) {
         Log::Print("SoxrPcmProcessor: Initialization Failed! Error Token: %s\n", soxr_strerror(iError));
     }
     ASSERT(iInstance != nullptr);
 }
-
-
-
 
 void SoxrPcmProcessor::SoxrPcmProcPimpl::ProcessFragmentWithSoxr(
     const Brx& aData, TUint aNumChannels, TUint aSubsampleBytes)
@@ -93,30 +91,6 @@ void SoxrPcmProcessor::SoxrPcmProcPimpl::ProcessFragmentWithSoxr(
     if (inputFrames == 0) {
         return;
     }
-    const TBool duplicateMono = (aNumChannels == 1 && iTargetChannels == 2);
-    const Brx* inputData = &aData;
-    std::vector<TByte> expandedInput;
-    Brn expandedWrapper;
-
-    if (duplicateMono) {
-        expandedInput.resize(inputFrames * 2 * aSubsampleBytes);
-
-        const TByte* source = aData.Ptr();
-        TByte* destination = expandedInput.data();
-
-        for (size_t frame = 0; frame < inputFrames; ++frame) {
-            std::memcpy(destination, source, aSubsampleBytes);
-            destination += aSubsampleBytes;
-
-            std::memcpy(destination, source, aSubsampleBytes);
-            destination += aSubsampleBytes;
-
-            source += aSubsampleBytes;
-        }
-
-        expandedWrapper.Set(expandedInput.data(), expandedInput.size());
-        inputData = &expandedWrapper;
-    }
 
     const double ratio = iSpec.iOutputRate / iSpec.iInputRate;
     const size_t maxOutputFrames =
@@ -124,27 +98,36 @@ void SoxrPcmProcessor::SoxrPcmProcPimpl::ProcessFragmentWithSoxr(
             1,
             static_cast<size_t>(std::ceil(inputFrames * ratio)) + 32);
     
-            const TUint bytesPerOutputFrame = iTargetChannels * 4;
-    std::vector<TByte> outputBuffer(maxOutputFrames * bytesPerOutputFrame);
+    // The resampler operates symmetrically. Output width matches internal channels (always 1 for mono)
+    // The target data type is hard-locked to SOXR_INT32_I, which means exactly 4 bytes per sample.
+    const TUint bytesPerResamplerFrame =
+        iSpec.iNumChannels * kOutputSampleBytes;
+    std::vector<TByte> resamplerBuffer(maxOutputFrames * bytesPerResamplerFrame);
     size_t outputFramesProcessed = 0;
 
     iError = soxr_process(iInstance,
-                          inputData->Ptr(),
+                          aData.Ptr(),
                           inputFrames,
                           nullptr,
-                          outputBuffer.data(),
+                          resamplerBuffer.data(),
                           maxOutputFrames,
                           &outputFramesProcessed);
     if (iError) {
         Log::Print("SoxrPcmProcessor: Processing Error: %s\n",
-                   soxr_strerror(iError));
+                    soxr_strerror(iError));
         return;
     }
 
     if (outputFramesProcessed != 0) {
-        Brn output(outputBuffer.data(),
-                   outputFramesProcessed * bytesPerOutputFrame);
-        iSink.Write(output);
+        if (iDuplicateMono) {
+            WriteMonoAsStereo(
+            resamplerBuffer.data(),
+            outputFramesProcessed);
+        }
+        else {
+            Brn output(resamplerBuffer.data(), outputFramesProcessed * bytesPerResamplerFrame);
+            iSink.Write(output);
+        }
     }
 }
 
@@ -155,8 +138,9 @@ void SoxrPcmProcessor::SoxrPcmProcPimpl::FlushResamplerCache()
     }
 
     constexpr size_t flushFrames = 2048;
-    const TUint bytesPerOutputFrame = iTargetChannels * 4;
-    std::vector<TByte> buffer(flushFrames * bytesPerOutputFrame);
+    const TUint resamplerChannels = iSpec.iNumChannels;
+    const TUint bytesPerResamplerFrame = resamplerChannels * kOutputSampleBytes; // Always 4 bytes per sample (INT32)
+    std::vector<TByte> buffer(flushFrames * bytesPerResamplerFrame);
 
     for (;;) {
         size_t outputFrames = 0;
@@ -171,17 +155,40 @@ void SoxrPcmProcessor::SoxrPcmProcPimpl::FlushResamplerCache()
 
         if (iError) {
             Log::Print("SoxrPcmProcessor: Flush Error: %s\n",
-                       soxr_strerror(iError));
+                soxr_strerror(iError));
             return;
         }
-
         if (outputFrames == 0) {
             break;
         }
-
-        Brn output(buffer.data(), outputFrames * bytesPerOutputFrame);
-        iSink.Write(output);
+        if (iDuplicateMono) {
+            WriteMonoAsStereo(buffer.data(), outputFrames);
+        }
+        else {
+            Brn output(buffer.data(), outputFrames * bytesPerResamplerFrame);
+            iSink.Write(output);
+        }
     }
+}
+
+void SoxrPcmProcessor::SoxrPcmProcPimpl::WriteMonoAsStereo(const TByte* aSource, size_t aFrames)
+{
+    const TUint stereoFrameBytes = 2 * kOutputSampleBytes;
+    const auto newSize=aFrames * stereoFrameBytes;
+    if(iStereoBuffer.size()!=newSize) iStereoBuffer.resize(newSize);
+
+    TByte* destination = iStereoBuffer.data();
+    for (size_t frame = 0; frame < aFrames; ++frame) {
+        // memcpy avoids alignment and aliasing assumptions.
+        std::memcpy(destination, aSource, kOutputSampleBytes);
+        std::memcpy(destination + kOutputSampleBytes, aSource, kOutputSampleBytes);
+
+        aSource += kOutputSampleBytes;
+        destination += stereoFrameBytes;
+    }
+
+    Brn output(iStereoBuffer.data(), iStereoBuffer.size());
+    iSink.Write(output);
 }
 
 SoxrPcmProcessor::SoxrPcmProcessor(
@@ -247,7 +254,7 @@ void SoxrPcmProcessor::ProcessFragment(
     iPendingSampleBytes = aSubsampleBytes;
     iBuffer->Append(aData);
 
-    const TUint completeBytes =
+    const TUint completeBytes = 
         (iBuffer->Bytes() / bytesPerFrame) * bytesPerFrame;
 
     const TUint remainingBytes = iBuffer->Bytes() - completeBytes;
@@ -317,34 +324,34 @@ void SoxrPcmProcessor::ProcessCompleteFragment(const Brx& aData, TUint aNumChann
             conversionBuffer.resize(numSamples * 4);
             const TByte* src = aData.Ptr();
             TByte* dest = conversionBuffer.data();
-            
+
             for (TUint i = 0; i < numSamples; ++i) {
                 // Read 3 raw bytes explicitly
                 TUint32 val = (static_cast<TUint32>(src[0])) |
                               (static_cast<TUint32>(src[1]) << 8) |
                               (static_cast<TUint32>(src[2]) << 16);
 
-                // Sign-extend negative 24-bit samples to 32-bit values
-                if (val & 0x800000) {
-                    val |= 0xFF000000;
-                }
-
-                // Align bits to the MSB side for standard 32-bit PCM audio pipelines
-                val <<= 8; 
-
-                std::memcpy(dest, &val, 4);
-                src += 3;
-                dest += 4;
+            // Sign-extend negative 24-bit samples to 32-bit values
+            if (val & 0x800000) {
+                val |= 0xFF000000;
             }
-            localThreadWrapper.Set(conversionBuffer.data(), conversionBuffer.size());
-            dataToProcess = &localThreadWrapper;
-            break;
+
+            // Align bits to the MSB side for standard 32-bit PCM audio pipelines
+            val <<= 8;
+
+            std::memcpy(dest, &val, 4);
+            src += 3;
+            dest += 4;
         }
-        case 4: 
-            inputType = SOXR_INT32_I; 
+        localThreadWrapper.Set(conversionBuffer.data(), conversionBuffer.size());
+        dataToProcess = &localThreadWrapper;
+        break;
+        }
+        case 4:
+            inputType = SOXR_INT32_I;
             break;
-        default: 
-            return; 
+        default:
+        return;
     }
 
     const TUint effectiveSampleBytes =
@@ -355,9 +362,16 @@ void SoxrPcmProcessor::ProcessCompleteFragment(const Brx& aData, TUint aNumChann
     if (!iImpl || iCurrentSpec.iNumChannels != aNumChannels ||
         iImpl->GetInputType() != inputType)
     {
+        if (iImpl) {
+            iImpl->FlushResamplerCache();
+            iImpl.reset();
+        }
         iCurrentSpec.iNumChannels = aNumChannels;
         iImpl = std::make_unique<SoxrPcmProcPimpl>(
             *iSink, iCurrentSpec, inputType, iDuplicateChannel);
+        if (!iImpl) {
+            return;
+        }
     }
 
     iImpl->ProcessFragmentWithSoxr(

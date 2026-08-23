@@ -320,7 +320,7 @@ void DriverAlsa::Pimpl::ProcessDecodedStream(MsgDecodedStream* aMsg)
         }
     }
 
-    auto decodedStreamInfo = aMsg->StreamInfo();
+    const auto & decodedStreamInfo = aMsg->StreamInfo();
 
     Log::Print("DriverAlsa: Bytes Sent since last MsgDecodedStream = %d\n",
                iBytesSent);
