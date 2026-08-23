@@ -203,7 +203,7 @@ private:
     IOhmTimestamper* iTxTimestamper;
     IOhmTimestamper* iRxTimestamper;
     //VolumeSinkLogger iVolumeLogger;
-    VolumeControl    iVolumeLogger;
+    std::unique_ptr<VolumeControl>   iVolumeCtrl;
     std::unique_ptr<Media::AudioTimeCpu> iAudioTime;
     Bws<Uri::kMaxUriBytes+1> iPresentationUrl;
     std::unique_ptr<Media::LoggingPipelineObserver> iPipelineObserver;

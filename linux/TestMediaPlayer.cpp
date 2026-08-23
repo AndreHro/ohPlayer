@@ -242,11 +242,21 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
         Log::Print("No store file parameter specified - will not attempt to load store values from file, and changes to store values will not be persisted.\n");
     }
 
+    const TChar* alsaCardString         = "default";
+    const std::vector<Brn> mixerList{Brn("Digital"), Brn("PCM"), Brn("Master"),
+         Brn("Speaker"), Brn("DAC"), Brn("Analogue") };
+
     VolumeProfile volumeProfile;
     VolumeConsumer volumeInit;
-    volumeInit.SetVolume(iVolumeLogger);
-    volumeInit.SetBalance(iVolumeLogger);
-    volumeInit.SetFade(iVolumeLogger);
+    bool isVolumeDisabled=1;
+    iVolumeCtrl = std::make_unique<OpenHome::Av::VolumeControl>(
+        isVolumeDisabled, 
+        alsaCardString, 
+        mixerList
+    );
+    volumeInit.SetVolume(*iVolumeCtrl);
+    volumeInit.SetBalance(*iVolumeCtrl);
+    volumeInit.SetFade(*iVolumeCtrl);
 
     // Create MediaPlayer.
     // NOTE: If values for Room.Name and Product.Name already exist in the Store,
