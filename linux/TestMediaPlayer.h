@@ -32,6 +32,7 @@
 #include <OpenHome/Net/Odp/DviServerOdp.h>
 #include <OpenHome/FsFlushPeriodic.h>
 #include "DriverAlsa.h"
+#include "SourceAlsaCapture.h"
 
 #include <memory>
 
@@ -223,7 +224,8 @@ private:
     TUint iUiMsgBufCount;
     TUint iUiMsgBufBytes;
 
-    std::unique_ptr<OpenHome::Media::DriverAlsa> iDriver;
+    std::unique_ptr<Media::DriverAlsa> iDriver;
+    std::unique_ptr<AlsaCapture::SourceAlsaCapture> iSourceAlsaCapture;
     std::unique_ptr<Media::IPipelineObserver>    iRaspdacObserver;
     std::unique_ptr<IVolumeObserver>         iRaspdacVolumeObserver;
 };

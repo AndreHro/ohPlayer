@@ -35,6 +35,8 @@
 #include <OpenHome/Net/Odp/DviProtocolOdp.h>
 #include <OpenHome/Private/Debug.h>
 #include "DriverAlsa.h"
+#include "SourceAlsaCapture.h"
+#include "ProtocolAlsaCapture.h"
 
 #include <vector>
 
@@ -534,6 +536,9 @@ void TestMediaPlayer::RegisterPlugins(Environment& aEnv)
     }
     iMediaPlayer->Add(ProtocolFactory::NewCalmRadio(aEnv, ssl, iUserAgent, *iMediaPlayer));
 
+    Media::ProtocolAlsaCapture::DevParam devParam;
+    iMediaPlayer->Add(new Media::ProtocolAlsaCapture(devParam, aEnv));
+
     // Add sources
     iMediaPlayer->Add(SourceFactory::NewPlaylist(*iMediaPlayer, Optional<IPlaylistLoader>(iPlaylistLoader.get())));
     if (iTuneInPartnerId.Bytes() == 0) {
@@ -578,6 +583,8 @@ void TestMediaPlayer::RegisterPlugins(Environment& aEnv)
 #else
     iMediaPlayer->Add(SourceFactory::NewScd(*iMediaPlayer, nullptr));
 #endif
+    iMediaPlayer->Add(new AlsaCapture::SourceAlsaCapture(*iMediaPlayer));
+
 }
 
 void TestMediaPlayer::InitialiseSubsystems()
