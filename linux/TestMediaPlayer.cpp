@@ -550,6 +550,7 @@ void TestMediaPlayer::RegisterPlugins(Environment& aEnv)
         iMediaPlayer->Add(SourceFactory::NewRadio(*iMediaPlayer));
     }
     else {
+        //iMediaPlayer->Add(
         iMediaPlayer->Add(SourceFactory::NewRadio(*iMediaPlayer, iTuneInPartnerId));
     }
 

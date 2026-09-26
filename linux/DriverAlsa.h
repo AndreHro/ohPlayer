@@ -6,6 +6,8 @@
 #include <OpenHome/Media/Utils/ProcessorAudioUtils.h>
 #include <OpenHome/Private/Thread.h>
 
+
+
 namespace OpenHome {
 namespace Media {
 
@@ -22,36 +24,76 @@ private:
     const TUint iOpenHomeMax;
 };
 
-
-class DriverAlsa : public PipelineElement, public IPipelineAnimator, private INonCopyable
+class IDriverBackend
 {
-    static const TUint kSupportedMsgTypes;
 public:
-    DriverAlsa(IPipeline& aPipeline, TUint aBufferUs);
-    ~DriverAlsa();
-public:
+    virtual ~IDriverBackend() = default;
+
+    virtual void ProcessDecodedStream(MsgDecodedStream*) = 0;
+    virtual void ProcessPlayable(MsgPlayable*) = 0;
+    virtual void ProcessDrain() = 0;
+    virtual void ProcessMode() = 0;
+    virtual TUint DriverDelayJiffies(TUint aSampleRate) = 0;
+};
+
+class PipelineDriverBase
+    : public PipelineElement
+    , public IPipelineAnimator
+    , private INonCopyable
+{
+protected:
+    PipelineDriverBase(IPipeline& aPipeline,
+                       std::unique_ptr<IDriverBackend> aBackend);
+
+    ~PipelineDriverBase();
+
     void AudioThread();
-private: // from IMsgProcessor
-    Msg* ProcessMsg(MsgMode* aMsg) override;
-    Msg* ProcessMsg(MsgDrain* aMsg) override;
-    Msg* ProcessMsg(MsgHalt* aMsg) override;
-    Msg* ProcessMsg(MsgDecodedStream* aMsg) override;
-    Msg* ProcessMsg(MsgPlayable* aMsg) override;
-    Msg* ProcessMsg(MsgQuit* aMsg) override;
-private: // from IPipelineAnimator
-    TUint PipelineAnimatorBufferJiffies() const override;
-    TUint PipelineAnimatorDelayJiffies(AudioFormat aFormat, TUint aSampleRate,
-                                       TUint aBitDepth, TUint aNumChannels) const override;
-    void PipelineAnimatorDsdBlockConfiguration(TUint& aSampleBlockWords, TUint& aPadBytesPerChunk) const override;
-    TUint PipelineAnimatorMaxBitDepth() const override;
-    void  PipelineAnimatorGetMaxSampleRates(TUint& aPcm, TUint& aDsd) const override;
+
+    TUint GetSupportedElements()
+    {
+        return
+        PipelineElement::MsgType::eMode |
+        PipelineElement::MsgType::eDrain |
+        PipelineElement::MsgType::eHalt |
+        PipelineElement::MsgType::eDecodedStream |
+        PipelineElement::MsgType::ePlayable |
+        PipelineElement::MsgType::eQuit;
+    }
+
 private:
-    class Pimpl;
-    Pimpl* iPimpl;
+    Msg* ProcessMsg(MsgMode*) override;
+    Msg* ProcessMsg(MsgDrain*) override;
+    Msg* ProcessMsg(MsgHalt*) override;
+    Msg* ProcessMsg(MsgDecodedStream*) override;
+    Msg* ProcessMsg(MsgPlayable*) override;
+    Msg* ProcessMsg(MsgQuit*) override;
+
+    TUint PipelineAnimatorBufferJiffies() const override;
+    TUint PipelineAnimatorDelayJiffies(
+        AudioFormat, TUint, TUint, TUint) const override;
+    void PipelineAnimatorDsdBlockConfiguration(
+        TUint&, TUint&) const override;
+    TUint PipelineAnimatorMaxBitDepth() const override;
+    void PipelineAnimatorGetMaxSampleRates(
+        TUint&, TUint&) const override;
+
+protected:
     IPipeline& iPipeline;
     Mutex iMutex;
     TBool iQuit;
-    ThreadFunctor *iThread;
+    std::unique_ptr<IDriverBackend> iBackend;
+    std::unique_ptr<ThreadFunctor> iThread;
+};
+
+class DriverAlsa final : public PipelineDriverBase
+{
+public:
+    DriverAlsa(IPipeline& aPipeline, const Brx& aAlsaDevice, TUint aBufferUs, TUint aOutputSampleRate=0);
+};
+class CamillaDspDriver final : public PipelineDriverBase
+{
+public:
+    CamillaDspDriver(IPipeline& aPipeline, const Brx& aCamilloDsp, TUint aBufferUs);
 };
 
 } // namespace Media

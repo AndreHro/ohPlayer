@@ -44,6 +44,7 @@ private:
     soxr_datatype_t iInputType;
     TBool           iDuplicateMono;
     std::vector<TByte> iStereoBuffer;
+    std::vector<TByte> iOutputBuffer;
 };
 
 SoxrPcmProcessor::SoxrPcmProcPimpl::SoxrPcmProcPimpl(IDataSink& aDataSink, const AudioSpec& aSpec, soxr_datatype_t aInputType, bool aDuplicateChannel)
@@ -53,6 +54,8 @@ SoxrPcmProcessor::SoxrPcmProcPimpl::SoxrPcmProcPimpl(IDataSink& aDataSink, const
 , iSpec(aSpec)
 , iInputType(aInputType)
 , iDuplicateMono(aSpec.iNumChannels == 1 && aDuplicateChannel)
+, iStereoBuffer()
+, iOutputBuffer()
 {
     // Guard against zero division errors if an invalid spec leaks through
     if (iSpec.iInputRate <= 0.0)  iSpec.iInputRate = 44100.0;
@@ -102,14 +105,15 @@ void SoxrPcmProcessor::SoxrPcmProcPimpl::ProcessFragmentWithSoxr(
     // The target data type is hard-locked to SOXR_INT32_I, which means exactly 4 bytes per sample.
     const TUint bytesPerResamplerFrame =
         iSpec.iNumChannels * kOutputSampleBytes;
-    std::vector<TByte> resamplerBuffer(maxOutputFrames * bytesPerResamplerFrame);
+    iOutputBuffer.resize(maxOutputFrames * bytesPerResamplerFrame);
+    
     size_t outputFramesProcessed = 0;
 
     iError = soxr_process(iInstance,
                           aData.Ptr(),
                           inputFrames,
                           nullptr,
-                          resamplerBuffer.data(),
+                          iOutputBuffer.data(),
                           maxOutputFrames,
                           &outputFramesProcessed);
     if (iError) {
@@ -120,12 +124,11 @@ void SoxrPcmProcessor::SoxrPcmProcPimpl::ProcessFragmentWithSoxr(
 
     if (outputFramesProcessed != 0) {
         if (iDuplicateMono) {
-            WriteMonoAsStereo(
-            resamplerBuffer.data(),
-            outputFramesProcessed);
+            WriteMonoAsStereo(iOutputBuffer.data(), outputFramesProcessed);
         }
         else {
-            Brn output(resamplerBuffer.data(), outputFramesProcessed * bytesPerResamplerFrame);
+            const TUint outputBytes = outputFramesProcessed * bytesPerResamplerFrame;
+            Brn output(iOutputBuffer.data(), outputBytes);
             iSink.Write(output);
         }
     }
@@ -140,7 +143,7 @@ void SoxrPcmProcessor::SoxrPcmProcPimpl::FlushResamplerCache()
     constexpr size_t flushFrames = 2048;
     const TUint resamplerChannels = iSpec.iNumChannels;
     const TUint bytesPerResamplerFrame = resamplerChannels * kOutputSampleBytes; // Always 4 bytes per sample (INT32)
-    std::vector<TByte> buffer(flushFrames * bytesPerResamplerFrame);
+    iOutputBuffer.resize(flushFrames * bytesPerResamplerFrame);
 
     for (;;) {
         size_t outputFrames = 0;
@@ -149,23 +152,24 @@ void SoxrPcmProcessor::SoxrPcmProcPimpl::FlushResamplerCache()
                               nullptr,
                               0,
                               nullptr,
-                              buffer.data(),
+                              iOutputBuffer.data(),
                               flushFrames,
                               &outputFrames);
 
         if (iError) {
             Log::Print("SoxrPcmProcessor: Flush Error: %s\n",
-                soxr_strerror(iError));
+                    soxr_strerror(iError));
             return;
         }
         if (outputFrames == 0) {
             break;
         }
         if (iDuplicateMono) {
-            WriteMonoAsStereo(buffer.data(), outputFrames);
+            WriteMonoAsStereo(iOutputBuffer.data(), outputFrames);
         }
         else {
-            Brn output(buffer.data(), outputFrames * bytesPerResamplerFrame);
+            const TUint outputBytes = outputFrames * bytesPerResamplerFrame;
+            Brn output(iOutputBuffer.data(), outputBytes);
             iSink.Write(output);
         }
     }
@@ -174,12 +178,11 @@ void SoxrPcmProcessor::SoxrPcmProcPimpl::FlushResamplerCache()
 void SoxrPcmProcessor::SoxrPcmProcPimpl::WriteMonoAsStereo(const TByte* aSource, size_t aFrames)
 {
     const TUint stereoFrameBytes = 2 * kOutputSampleBytes;
-    const auto newSize=aFrames * stereoFrameBytes;
-    if(iStereoBuffer.size()!=newSize) iStereoBuffer.resize(newSize);
+    const auto newSize = aFrames * stereoFrameBytes;
+    iStereoBuffer.resize(newSize);
 
     TByte* destination = iStereoBuffer.data();
     for (size_t frame = 0; frame < aFrames; ++frame) {
-        // memcpy avoids alignment and aliasing assumptions.
         std::memcpy(destination, aSource, kOutputSampleBytes);
         std::memcpy(destination + kOutputSampleBytes, aSource, kOutputSampleBytes);
 
@@ -187,7 +190,7 @@ void SoxrPcmProcessor::SoxrPcmProcPimpl::WriteMonoAsStereo(const TByte* aSource,
         destination += stereoFrameBytes;
     }
 
-    Brn output(iStereoBuffer.data(), iStereoBuffer.size());
+    Brn output(iStereoBuffer.data(), newSize);
     iSink.Write(output);
 }
 
@@ -273,17 +276,15 @@ void SoxrPcmProcessor::ProcessFragment(
     }
 
     // Copy the incomplete trailing frame before changing iBuffer.
-    std::vector<TByte> remainder(remainingBytes);
+    iRemainderBuffer.resize(remainingBytes);
 
-    std::memcpy(
-        remainder.data(),
-        iBuffer->Ptr() + completeBytes,
-        remainingBytes);
+    std::memcpy(iRemainderBuffer.data(),
+                iBuffer->Ptr() + completeBytes,
+                remainingBytes);
 
-    // Rebuild the buffer using the supported Bwx API.
     Clean();
 
-    Brn remainderData(remainder.data(), remainingBytes);
+    Brn remainderData(iRemainderBuffer.data(), remainingBytes);
     iBuffer->Append(remainderData);
 
     iPendingChannels = aNumChannels;
@@ -293,64 +294,112 @@ void SoxrPcmProcessor::ProcessFragment(
 void SoxrPcmProcessor::ProcessCompleteFragment(const Brx& aData, TUint aNumChannels, TUint aSubsampleBytes)
 {
     soxr_datatype_t inputType;
-    std::vector<TByte> conversionBuffer;
     const Brx* dataToProcess = &aData;
     Brn localThreadWrapper; // Fixed: Thread-safe local scope handling
-
+    
     switch(aSubsampleBytes) {
-        case 1: {
-            // Safe 8-bit to 16-bit expansion mapping
-            inputType = SOXR_INT16_I;
-            TUint numSamples = aData.Bytes();
-            conversionBuffer.resize(numSamples * 2);
-            const TUint8* src = reinterpret_cast<const TUint8*>(aData.Ptr());
-            TInt16* dest = reinterpret_cast<TInt16*>(conversionBuffer.data());
-            
-            for (TUint i = 0; i < numSamples; ++i) {
-                // Convert unsigned 8-bit offset to standard signed 16-bit PCM
-                dest[i] = static_cast<TInt16>((static_cast<TInt32>(src[i]) - 128) << 8);
-            }
-            localThreadWrapper.Set(conversionBuffer.data(), conversionBuffer.size());
-            dataToProcess = &localThreadWrapper;
-            break;
+    case 1: {
+        // Safe 8-bit to 16-bit expansion mapping
+        inputType = SOXR_INT16_I;
+
+        const TUint numSamples = aData.Bytes();
+        iInputBuffer.resize(numSamples * sizeof(TInt16));
+
+        const TByte* src = aData.Ptr();
+        TByte* dest = iInputBuffer.data();
+
+        for (TUint i = 0; i < numSamples; ++i) {
+            const TInt16 sample =
+                static_cast<TInt16>(
+                    (static_cast<TInt32>(src[i]) - 128) << 8);
+
+            std::memcpy(dest + i * sizeof(TInt16), &sample, sizeof(sample));
         }
-        case 2: 
-            inputType = SOXR_INT16_I; 
-            break;
-        case 3: {
-            // Sign-extended bit-perfect 24-bit to 32-bit container expansion
-            inputType = SOXR_INT32_I;
-            TUint numSamples = aData.Bytes() / 3;
-            conversionBuffer.resize(numSamples * 4);
-            const TByte* src = aData.Ptr();
-            TByte* dest = conversionBuffer.data();
 
-            for (TUint i = 0; i < numSamples; ++i) {
-                // Read 3 raw bytes explicitly
-                TUint32 val = (static_cast<TUint32>(src[0])) |
-                              (static_cast<TUint32>(src[1]) << 8) |
-                              (static_cast<TUint32>(src[2]) << 16);
-
-            // Sign-extend negative 24-bit samples to 32-bit values
-            if (val & 0x800000) {
-                val |= 0xFF000000;
-            }
-
-            // Align bits to the MSB side for standard 32-bit PCM audio pipelines
-            val <<= 8;
-
-            std::memcpy(dest, &val, 4);
-            src += 3;
-            dest += 4;
-        }
-        localThreadWrapper.Set(conversionBuffer.data(), conversionBuffer.size());
+        localThreadWrapper.Set(iInputBuffer.data(), iInputBuffer.size());
         dataToProcess = &localThreadWrapper;
         break;
+    }
+    case 2: {
+        inputType = SOXR_INT16_I;
+
+        const TUint numSamples = aData.Bytes() / 2;
+        iInputBuffer.resize(numSamples * sizeof(TInt16));
+
+        const TByte* src = aData.Ptr();
+        TByte* dest = iInputBuffer.data();
+
+        for (TUint i = 0; i < numSamples; ++i) {
+            // Input is packed big-endian; soxr expects native-endian PCM.
+            const TInt16 sample = static_cast<TInt16>(
+                (static_cast<TUint16>(src[0]) << 8) |
+                static_cast<TUint16>(src[1]));
+
+            std::memcpy(dest + i * sizeof(TInt16), &sample, sizeof(sample));
+            src += 2;
         }
-        case 4:
-            inputType = SOXR_INT32_I;
-            break;
-        default:
+
+        localThreadWrapper.Set(iInputBuffer.data(), iInputBuffer.size());
+        dataToProcess = &localThreadWrapper;
+        break;
+    }
+
+    case 3: {
+        inputType = SOXR_INT32_I;
+
+        const TUint numSamples = aData.Bytes() / 3;
+        iInputBuffer.resize(numSamples * sizeof(TInt32));
+
+        const TByte* src = aData.Ptr();
+        TByte* dest = iInputBuffer.data();
+
+        for (TUint i = 0; i < numSamples; ++i) {
+            TUint32 value =
+                (static_cast<TUint32>(src[0]) << 16) |
+                (static_cast<TUint32>(src[1]) << 8) |
+                static_cast<TUint32>(src[2]);
+
+            if ((value & 0x00800000u) != 0) {
+                value |= 0xFF000000u;
+            }
+
+            // Preserve the existing 24-bit-to-32-bit left alignment.
+            value <<= 8;
+
+            std::memcpy(dest + i * sizeof(TInt32), &value, sizeof(value));
+            src += 3;
+        }
+
+        localThreadWrapper.Set(iInputBuffer.data(), iInputBuffer.size());
+        dataToProcess = &localThreadWrapper;
+        break;
+    }
+
+    case 4: {
+        inputType = SOXR_INT32_I;
+
+        const TUint numSamples = aData.Bytes() / 4;
+        iInputBuffer.resize(numSamples * sizeof(TInt32));
+
+        const TByte* src = aData.Ptr();
+        TByte* dest = iInputBuffer.data();
+
+        for (TUint i = 0; i < numSamples; ++i) {
+            const TUint32 value =
+                (static_cast<TUint32>(src[0]) << 24) |
+                (static_cast<TUint32>(src[1]) << 16) |
+                (static_cast<TUint32>(src[2]) << 8) |
+                static_cast<TUint32>(src[3]);
+
+            std::memcpy(dest + i * sizeof(TInt32), &value, sizeof(value));
+            src += 4;
+        }
+
+        localThreadWrapper.Set(iInputBuffer.data(), iInputBuffer.size());
+        dataToProcess = &localThreadWrapper;
+        break;
+    }
+    default:
         return;
     }
 
