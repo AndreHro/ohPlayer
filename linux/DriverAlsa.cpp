@@ -45,10 +45,10 @@ using OutputFormat=std::pair<snd_pcm_format_t, TUint>;
 class Profile
 {
 public:
-    Profile(IPcmProcessor* aPcmProcessor, OutputFormat aFormat32,
-                                          OutputFormat aFormat24,
-                                          OutputFormat aFormat16,
-                                          OutputFormat aFormat8);
+    Profile(std::unique_ptr<IPcmProcessor> aPcmProcessor, OutputFormat aFormat32,
+                                                          OutputFormat aFormat24,
+                                                          OutputFormat aFormat16,
+                                                          OutputFormat aFormat8);
 public:
     OutputFormat   GetFormat(TUint aBitDepth) const;
     IPcmProcessor& GetPcmProcessor() const;
@@ -57,11 +57,11 @@ private:
     OutputFormat                   iOutputDesc[4];
 };
 
-Profile::Profile(IPcmProcessor* aPcmProcessor, OutputFormat aFormat32,
-                                               OutputFormat aFormat24,
-                                               OutputFormat aFormat16,
-                                               OutputFormat aFormat8)
-: iPcmProcessor(aPcmProcessor)
+Profile::Profile(std::unique_ptr<IPcmProcessor> aPcmProcessor, OutputFormat aFormat32,
+                                                               OutputFormat aFormat24,
+                                                               OutputFormat aFormat16,
+                                                               OutputFormat aFormat8)
+: iPcmProcessor(std::move(aPcmProcessor))
 {
     iOutputDesc[0] = aFormat32;
     iOutputDesc[1] = aFormat24;
@@ -89,6 +89,7 @@ OutputFormat Profile::GetFormat(TUint aBitDepth) const
 
 IPcmProcessor& Profile::GetPcmProcessor() const
 {
+    assert(iPcmProcessor != nullptr);
     return *iPcmProcessor;
 }
 
@@ -116,12 +117,11 @@ private:
     TBool TryProfile(Profile& aProfile, TUint aBitDepth, TUint aNumChannels,
                      TUint aSampleRate, TUint aBufferUs);
 private:
-    snd_pcm_t* iHandle;
+    snd_pcm_t* iHandle{nullptr};
     Bwh iSampleBuffer;  // buffer ProcessSampleX data
     TUint iSampleBytes;
     TBool iDuplicateChannel;
-    std::vector<Profile> iProfiles;
-    std::atomic<TInt> iProfileIndex{-1};
+    std::unique_ptr<Profile> iProfile;
     TBool iDitch;
     TUint iBytesSent;
     TUint iBufferUs;
@@ -140,7 +140,7 @@ DriverAlsaPimpl::DriverAlsaPimpl(const Brx& aAlsaDevice, TUint aBufferUs, TUint 
 , iSampleBuffer(kSampleBufSize)
 , iSampleBytes(0)
 , iDuplicateChannel(false)
-, iProfileIndex(-1)
+, iProfile(nullptr)
 , iDitch(false)
 , iBytesSent(0)
 , iBufferUs(aBufferUs)
@@ -148,12 +148,14 @@ DriverAlsaPimpl::DriverAlsaPimpl(const Brx& aAlsaDevice, TUint aBufferUs, TUint 
 , iCurrentOutputRate(aOutputSampleRate)
 {
     const Brhz devName(aAlsaDevice);
+    OhLog::Print("DriverAlsa: Opening ALSA device %s\n", devName.CString());
     const int err = snd_pcm_open(&iHandle, devName.CString(), SND_PCM_STREAM_PLAYBACK, 0);
 
     if (err < 0) {
         OhLog::PrintError(
             "DriverAlsa: snd_pcm_open() failed: %s\n", snd_strerror(err));
         iHandle = nullptr;
+        iDitch = true;
         return;
     }
 
@@ -163,12 +165,13 @@ DriverAlsaPimpl::DriverAlsaPimpl(const Brx& aAlsaDevice, TUint aBufferUs, TUint 
     initialSpec.iInputRate = 44100.0;
     initialSpec.iOutputRate = aOutputSampleRate != 0 ? aOutputSampleRate : 44100.0;
 
-    iProfiles.emplace_back(
-        new SoxrPcmProcessor(*this, iSampleBuffer, initialSpec),
+    auto pcmProcessor = std::make_unique<SoxrPcmProcessor>(*this, iSampleBuffer, initialSpec);
+    iProfile = std::make_unique<Profile>(
+        std::move(pcmProcessor),
         OutputFormat(SND_PCM_FORMAT_S32_LE, 4),
         OutputFormat(SND_PCM_FORMAT_S32_LE, 4),
         OutputFormat(SND_PCM_FORMAT_S32_LE, 4),
-        OutputFormat(SND_PCM_FORMAT_S32_LE, 4));
+        OutputFormat(SND_PCM_FORMAT_S32_LE, 4));   
 }
 
 DriverAlsaPimpl::~DriverAlsaPimpl()
@@ -182,42 +185,42 @@ DriverAlsaPimpl::~DriverAlsaPimpl()
 
 void DriverAlsaPimpl::ProcessPlayable(MsgPlayable* aMsg)
 {
-    const TInt profileIndex = iProfileIndex.load();
-    const TUint index=static_cast<TUint>(profileIndex);
-    if (profileIndex < 0 || (index >= iProfiles.size()) || iDitch) {
+    if (iProfile == nullptr || iDitch) {
         return;
     }
-    aMsg->Read(iProfiles[index].GetPcmProcessor());
+    auto & pcmProcessor = iProfile->GetPcmProcessor();
+    aMsg->Read(pcmProcessor);
 }
 
 void DriverAlsaPimpl::ProcessDrain()
 {
-    const TInt profileIndex = iProfileIndex.load();
-    if (profileIndex == -1) {
+    if (iProfile == nullptr || iHandle == nullptr) {
         return;
     }
-
-    // EndBlock flushes the resampler before ALSA is drained.
-    iProfiles[profileIndex].GetPcmProcessor().EndBlock();
+    // Flush the resampler before ALSA is drained.
+    iProfile->GetPcmProcessor().Flush();
 
     auto err = snd_pcm_drain(iHandle);
     if (err < 0) {
         OhLog::PrintError("DriverAlsa: snd_pcm_drain() error: %s\n",
                           snd_strerror(err));
-        ASSERTS();
-        return;
+        snd_pcm_drop(iHandle);
     }
 
     err = snd_pcm_prepare(iHandle);
     if (err < 0) {
         OhLog::PrintError("DriverAlsa: snd_pcm_prepare() error: %s\n",
                           snd_strerror(err));
-        ASSERTS();
+        snd_pcm_recover(iHandle, err, 1);
     }
 }
 
 void DriverAlsaPimpl::Write(const Brx& aData)
 {
+    if (iHandle == nullptr) {
+        return;
+    }
+
     if (iSampleBytes == 0) {
         OhLog::PrintError("DriverAlsa: invalid sample size\n");
         return;
@@ -227,8 +230,8 @@ void DriverAlsaPimpl::Write(const Brx& aData)
     snd_pcm_uframes_t framesRemaining = aData.Bytes() / iSampleBytes;
     
     TUint recoveryAttempts = 0;
-    TUint retryTimeouts=0;
-    const TUint kMaxRecoveryAttempts = 3; // Prevent infinite spinning loops
+    TUint retryTimeouts = 0;
+    const TUint kMaxRecoveryAttempts = 5;
 
     while (framesRemaining > 0) {
         snd_pcm_sframes_t framesWritten = snd_pcm_writei(iHandle, ptr, framesRemaining);
@@ -262,7 +265,7 @@ void DriverAlsaPimpl::Write(const Brx& aData)
             continue;
         }
         if (framesWritten == 0) {
-            const int err = snd_pcm_wait(iHandle, 50);
+            const int err = snd_pcm_wait(iHandle, 500);
 
             if (err < 0) {
                 OhLog::PrintError(
@@ -287,6 +290,14 @@ void DriverAlsaPimpl::Write(const Brx& aData)
 
             continue;
         }
+
+        const auto framesConsumed = static_cast<snd_pcm_uframes_t>(framesWritten);
+        const TUint bytesConsumed = framesConsumed * iSampleBytes;
+        ptr += bytesConsumed;
+        framesRemaining -= framesConsumed;
+        iBytesSent += bytesConsumed;
+        recoveryAttempts = 0;
+        retryTimeouts = 0;
     }
 }
 
@@ -367,20 +378,25 @@ void DriverAlsaPimpl::LogPCMState()
 
 void DriverAlsaPimpl::ProcessDecodedStream(MsgDecodedStream* aMsg)
 {
-    const TInt profileIndex = iProfileIndex.load();
-    if (profileIndex != -1) {
+    if (iProfile == nullptr) {
+        iDitch = true;
+        iSampleBytes = 0;
+        return;
+    }
+
+    if (iSampleBytes != 0) {
         ProcessDrain();
     }
 
     const auto & decodedStreamInfo = aMsg->StreamInfo();
 
-    Log::Print("DriverAlsa: Bytes Sent since last MsgDecodedStream = %d\n",
+    Log::Print("DriverAlsa: Bytes Sent since last MsgDecodedStream = %u\n",
                iBytesSent);
 
     iBytesSent = 0;
 
-    Log::Print("DriverAlsa: Finding PcmProcessor for stream: BitDepth = %d, "
-               "SampleRate = %d, Channels = %d\n",
+    Log::Print("DriverAlsa: Finding PcmProcessor for stream: BitDepth = %u, "
+               "SampleRate = %u, Channels = %u\n",
                decodedStreamInfo.BitDepth(), decodedStreamInfo.SampleRate(),
                decodedStreamInfo.NumChannels());
 
@@ -402,78 +418,66 @@ void DriverAlsaPimpl::ProcessDecodedStream(MsgDecodedStream* aMsg)
                                                 : decodedStreamInfo.SampleRate();
     iCurrentOutputRate.store(outputRate);
 
-    for (TUint i = 0; i < iProfiles.size(); ++i)
-    {
-        if (TryProfile(iProfiles[i], decodedStreamInfo.BitDepth(),
-                    decodedStreamInfo.NumChannels(),
-                    outputRate, iBufferUs))
-        {
-            iProfileIndex.store(i);
-            SoxrPcmProcessor& pcmProcessor =
-                    static_cast<SoxrPcmProcessor&>(
-                        iProfiles[i].GetPcmProcessor());
-
-            AudioSpec spec{};
-            spec.iNumChannels = decodedStreamInfo.NumChannels();
-            spec.iBitDepth = decodedStreamInfo.BitDepth();
-            spec.iInputRate = decodedStreamInfo.SampleRate();
-            spec.iOutputRate = outputRate;
-
-            pcmProcessor.SetDuplicateChannel(iDuplicateChannel);
-            pcmProcessor.UpdateFormatSpec(spec);
-
-            const OutputFormat outputFormat =
-            iProfiles[i].GetFormat(spec.iBitDepth);
-
-            const TUint outputChannels =
-                (iDuplicateChannel && spec.iNumChannels == 1) ? 2 :
-                spec.iNumChannels;
-
-            iSampleBytes = outputChannels * outputFormat.second;
-            iDitch = false;
-
-            Log::Print("Found PcmProcessor %d\n", i);
-
-            return;
-        }
+    const TUint bitDepth = decodedStreamInfo.BitDepth();
+    if (!TryProfile(*iProfile, bitDepth, decodedStreamInfo.NumChannels(),
+                    outputRate, iBufferUs)) {
+        Log::Print("DriverAlsa: No usable ALSA profile for stream: BitDepth = %u, "
+                   "SampleRate = %u, Channels = %u\n",
+                   bitDepth, decodedStreamInfo.SampleRate(),
+                   decodedStreamInfo.NumChannels());
+        iSampleBytes = 0;
+        iDitch = true;
+        return;
     }
 
-    OhLog::PrintWarning("DriverAlsa: Could not find a PcmProcessor for stream! "
-               "BitDepth = %d, SampleRate = %d, Channels = %d\n",
-               decodedStreamInfo.BitDepth(), decodedStreamInfo.SampleRate(),
-               decodedStreamInfo.NumChannels());
+    SoxrPcmProcessor& pcmProcessor =
+        static_cast<SoxrPcmProcessor&>(iProfile->GetPcmProcessor());
+    AudioSpec spec{};
+    spec.iNumChannels = decodedStreamInfo.NumChannels();
+    spec.iBitDepth = bitDepth;
+    spec.iInputRate = decodedStreamInfo.SampleRate();
+    spec.iOutputRate = outputRate;
 
-    iDitch = true;
-    iProfileIndex.store(-1);
+    pcmProcessor.SetDuplicateChannel(iDuplicateChannel);
+    pcmProcessor.UpdateFormatSpec(spec);
+
+    const OutputFormat outputFormat = iProfile->GetFormat(bitDepth);
+    const TUint outputChannels =
+        (iDuplicateChannel && spec.iNumChannels == 1) ? 2 : spec.iNumChannels;
+    iSampleBytes = outputChannels * outputFormat.second;
+    iDitch = false;
 }
 
 TBool DriverAlsaPimpl::TryProfile(Profile& aProfile,
-                                    TUint aBitDepth,
-                                    TUint aNumChannels,
-                                    TUint aSampleRate,
-                                    TUint aBufferUs)
+                                  TUint aBitDepth,
+                                  TUint aNumChannels,
+                                  TUint aSampleRate,
+                                  TUint aBufferUs)
 {
-    auto outputFormat = aProfile.GetFormat(aBitDepth);
+    if (aBitDepth != 32 && aBitDepth != 24 &&
+        aBitDepth != 16 && aBitDepth != 8) {
+        return false;
+    }
 
+    if (iHandle == nullptr) {
+        return false;
+    }
+
+    auto outputFormat = aProfile.GetFormat(aBitDepth);
 
     snd_pcm_hw_params_t* hwParams;
     snd_pcm_sw_params_t* swParams;
     snd_pcm_hw_params_alloca(&hwParams);
     snd_pcm_sw_params_alloca(&swParams);
 
-    if (iHandle == nullptr) {
-        return false;
+    // Only call snd_pcm_hw_free if the device has already been configured.
+    // Calling it in SND_PCM_STATE_OPEN returns -EBADFD and causes setup to fail.
+    const snd_pcm_state_t state = snd_pcm_state(iHandle);
+    if (state != SND_PCM_STATE_OPEN) {
+        snd_pcm_hw_free(iHandle);
     }
 
-    int err = snd_pcm_hw_free(iHandle);
-    if (err < 0) {
-        OhLog::PrintError(
-            "DriverAlsa: snd_pcm_hw_free() failed: %s\n",
-            snd_strerror(err));
-        return false;
-    }
-
-    err = snd_pcm_hw_params_any(iHandle, hwParams);
+    int err = snd_pcm_hw_params_any(iHandle, hwParams);
     if (err < 0) return false;
 
     err = snd_pcm_hw_params_set_access(iHandle, hwParams,
@@ -485,8 +489,7 @@ TBool DriverAlsaPimpl::TryProfile(Profile& aProfile,
     if (err < 0) return false;
 
     const TUint outputChannels =
-    (iDuplicateChannel && aNumChannels == 1) ? 2 :
-    aNumChannels;
+        (iDuplicateChannel && aNumChannels == 1) ? 2 : aNumChannels;
 
     err = snd_pcm_hw_params_set_channels(
         iHandle,
@@ -563,7 +566,7 @@ TUint DriverAlsaPimpl::DriverDelayJiffies(TUint aSampleRate)
         ? iCurrentOutputRate.load()
         : aSampleRate;
 
-    if (!aSampleRate || iProfileIndex.load() == -1) {
+    if (iHandle == nullptr || !aSampleRate) {
         return 0;
     }
 
@@ -571,17 +574,9 @@ TUint DriverAlsaPimpl::DriverDelayJiffies(TUint aSampleRate)
     int ret = snd_pcm_delay(iHandle, &delayFrames);
 
     if (ret < 0) {
-        ret = snd_pcm_recover(iHandle, ret, 1);
-        if (ret < 0) {
-            OhLog::PrintError("DriverAlsa: snd_pcm_delay() error: %s\n",
-                              snd_strerror(ret));
-            return 0;
-        }
-
-        ret = snd_pcm_delay(iHandle, &delayFrames);
-        if (ret < 0) {
-            return 0;
-        }
+        // Do not call snd_pcm_recover here: DriverDelayJiffies is called
+        // from the pipeline animator thread and can race with AudioThread writes.
+        return 0;
     }
 
     if (delayFrames < 0) {
@@ -593,26 +588,24 @@ TUint DriverAlsaPimpl::DriverDelayJiffies(TUint aSampleRate)
 
 void DriverAlsaPimpl::ProcessMode()
 {
-    const TInt profileIndex = iProfileIndex.load();
-
-    Log::Print(
+    OhLog::Print(
         "DriverAlsa: MsgMode intercepted. Purging pipeline tracking state.\n");
 
-    if (profileIndex >= 0 &&
-        static_cast<size_t>(profileIndex) < iProfiles.size()) {
-        iProfiles[static_cast<size_t>(profileIndex)]
-            .GetPcmProcessor()
-            .Flush();
+    if (iProfile != nullptr) {
+        iProfile->GetPcmProcessor().Flush();
     }
 
     iSampleBytes = 0;
-    iDitch = false;
+    iDitch = true;
     iBytesSent = 0;
-    iProfileIndex.store(-1);
 }
 
 DriverAlsa::DriverAlsa(IPipeline& aPipeline, const Brx& aAlsaDevice, TUint aBufferUs, TUint aOutputSampleRate)
 : PipelineDriverBase(aPipeline, std::make_unique<DriverAlsaPimpl>(aAlsaDevice, aBufferUs, aOutputSampleRate))
+{}
+
+DriverAlsa::DriverAlsa(IPipeline& aPipeline, TUint aBufferUs, TUint aOutputSampleRate)
+: DriverAlsa(aPipeline, Brn("default"), aBufferUs, aOutputSampleRate)
 {}
 
 PipelineDriverBase::PipelineDriverBase(
@@ -634,7 +627,10 @@ PipelineDriverBase::PipelineDriverBase(
 }
 
 PipelineDriverBase::~PipelineDriverBase()
-{}
+{
+    iThread.reset();
+    iBackend.reset();
+}
 
 void PipelineDriverBase::PipelineAnimatorGetMaxSampleRates(TUint& aPcm, TUint& aDsd) const
 {
@@ -721,7 +717,8 @@ Msg* PipelineDriverBase::ProcessMsg(MsgQuit* aMsg)
 Msg* PipelineDriverBase::ProcessMsg(MsgMode* aMsg)
 {
     const Brx& modeName = aMsg->Mode();
-    Log::Print("DriverAlsa: MsgMode intercepted. %s \n", PBUF(modeName));
+    Brhz modeNameCStr(modeName); 
+    OhLog::Print("DriverAlsa: MsgMode intercepted. %s \n", modeNameCStr.CString());
 
     iBackend->ProcessMode();
 

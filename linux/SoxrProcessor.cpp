@@ -35,7 +35,7 @@ public:
 
 private:
 
-    void WriteMonoAsStereo(const TByte* aSource, size_t aFrames);
+    void WriteMonoAsStereo(const TByte* aSource, TUint aFrames);
 
     IDataSink&      iSink;
     soxr_t          iInstance;
@@ -85,21 +85,25 @@ SoxrPcmProcessor::SoxrPcmProcPimpl::SoxrPcmProcPimpl(IDataSink& aDataSink, const
 void SoxrPcmProcessor::SoxrPcmProcPimpl::ProcessFragmentWithSoxr(
     const Brx& aData, TUint aNumChannels, TUint aSubsampleBytes)
 {
+    if (aData.Bytes() == 0 || aData.Ptr() == nullptr) {
+        return; 
+    }
+
     const TUint bytesPerInputFrame = aNumChannels * aSubsampleBytes;
     if (bytesPerInputFrame == 0) {
         return;
     }
 
-    const size_t inputFrames = aData.Bytes() / bytesPerInputFrame;
+    const TUint inputFrames = aData.Bytes() / bytesPerInputFrame;
     if (inputFrames == 0) {
         return;
     }
 
     const double ratio = iSpec.iOutputRate / iSpec.iInputRate;
-    const size_t maxOutputFrames =
-        std::max<size_t>(
+    const TUint maxOutputFrames =
+        std::max<TUint>(
             1,
-            static_cast<size_t>(std::ceil(inputFrames * ratio)) + 32);
+            static_cast<TUint>(std::ceil(inputFrames * ratio)) + 32);
     
     // The resampler operates symmetrically. Output width matches internal channels (always 1 for mono)
     // The target data type is hard-locked to SOXR_INT32_I, which means exactly 4 bytes per sample.
@@ -107,7 +111,7 @@ void SoxrPcmProcessor::SoxrPcmProcPimpl::ProcessFragmentWithSoxr(
         iSpec.iNumChannels * kOutputSampleBytes;
     iOutputBuffer.resize(maxOutputFrames * bytesPerResamplerFrame);
     
-    size_t outputFramesProcessed = 0;
+    TUint outputFramesProcessed = 0;
 
     iError = soxr_process(iInstance,
                           aData.Ptr(),
@@ -140,13 +144,13 @@ void SoxrPcmProcessor::SoxrPcmProcPimpl::FlushResamplerCache()
         return;
     }
 
-    constexpr size_t flushFrames = 2048;
+    constexpr TUint flushFrames = 2048;
     const TUint resamplerChannels = iSpec.iNumChannels;
     const TUint bytesPerResamplerFrame = resamplerChannels * kOutputSampleBytes; // Always 4 bytes per sample (INT32)
     iOutputBuffer.resize(flushFrames * bytesPerResamplerFrame);
 
     for (;;) {
-        size_t outputFrames = 0;
+        TUint outputFrames = 0;
 
         iError = soxr_process(iInstance,
                               nullptr,
@@ -175,14 +179,14 @@ void SoxrPcmProcessor::SoxrPcmProcPimpl::FlushResamplerCache()
     }
 }
 
-void SoxrPcmProcessor::SoxrPcmProcPimpl::WriteMonoAsStereo(const TByte* aSource, size_t aFrames)
+void SoxrPcmProcessor::SoxrPcmProcPimpl::WriteMonoAsStereo(const TByte* aSource, TUint aFrames)
 {
     const TUint stereoFrameBytes = 2 * kOutputSampleBytes;
     const auto newSize = aFrames * stereoFrameBytes;
     iStereoBuffer.resize(newSize);
 
     TByte* destination = iStereoBuffer.data();
-    for (size_t frame = 0; frame < aFrames; ++frame) {
+    for (TUint frame = 0; frame < aFrames; ++frame) {
         std::memcpy(destination, aSource, kOutputSampleBytes);
         std::memcpy(destination + kOutputSampleBytes, aSource, kOutputSampleBytes);
 
@@ -293,6 +297,11 @@ void SoxrPcmProcessor::ProcessFragment(
 
 void SoxrPcmProcessor::ProcessCompleteFragment(const Brx& aData, TUint aNumChannels, TUint aSubsampleBytes)
 {
+    const TUint bytesPerFrame = aNumChannels * aSubsampleBytes;
+    if (bytesPerFrame == 0 || aData.Bytes() < bytesPerFrame || aData.Ptr() == nullptr) {
+        return;
+    }
+
     soxr_datatype_t inputType;
     const Brx* dataToProcess = &aData;
     Brn localThreadWrapper; // Fixed: Thread-safe local scope handling
@@ -428,14 +437,10 @@ void SoxrPcmProcessor::ProcessCompleteFragment(const Brx& aData, TUint aNumChann
         aNumChannels,
         effectiveSampleBytes);
 }
-
 void SoxrPcmProcessor::EndBlock()
 {
-    if (iImpl) {
-        iImpl->FlushResamplerCache();
-    }
-
-    Clean();
+    // Continuous audio pipeline: MsgPlayable invokes BeginBlock/ProcessFragment/EndBlock
+    // on every audio message. Do not flush the resampler or discard remainder frames here.
 }
 
 void SoxrPcmProcessor::Flush()
@@ -454,11 +459,29 @@ double SoxrPcmProcessor::GetOutputRate() const
 
 void SoxrPcmProcessor::BeginBlock()
 {
-    Clean();
+    // No-op to preserve continuous audio streaming across playable blocks.
 }
 
 void SoxrPcmProcessor::ProcessSilence(
     const Brx& aData, TUint aNumChannels, TUint aSubsampleBytes)
 {
-    ProcessFragment(aData, aNumChannels, aSubsampleBytes);
+    TUint targetBytes = aData.Bytes();
+    if (targetBytes == 0) {
+        targetBytes = 128 * aNumChannels * aSubsampleBytes;
+    }
+
+    const TUint bytesPerFrame = aNumChannels * aSubsampleBytes;
+    if (bytesPerFrame == 0) {
+        return;
+    }
+    
+    const TUint alignedBytes = (targetBytes / bytesPerFrame) * bytesPerFrame;
+    if (alignedBytes == 0) {
+        return;
+    }
+
+    std::vector<TByte> silenceBuffer(alignedBytes, 0);
+    Brn silenceData(silenceBuffer.data(), alignedBytes);
+
+    ProcessCompleteFragment(silenceData, aNumChannels, aSubsampleBytes);
 }

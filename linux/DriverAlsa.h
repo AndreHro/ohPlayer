@@ -89,6 +89,7 @@ class DriverAlsa final : public PipelineDriverBase
 {
 public:
     DriverAlsa(IPipeline& aPipeline, const Brx& aAlsaDevice, TUint aBufferUs, TUint aOutputSampleRate=0);
+    DriverAlsa(IPipeline& aPipeline, TUint aBufferUs, TUint aOutputSampleRate=0);
 };
 class CamillaDspDriver final : public PipelineDriverBase
 {
