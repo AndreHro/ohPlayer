@@ -1,0 +1,41 @@
+#pragma once
+
+#include <OpenHome/Types.h>
+#include <OpenHome/Buffer.h>
+#include <OpenHome/Private/Thread.h>
+#include <string>
+#include <termios.h>
+
+namespace OpenHome {
+namespace Av {
+
+class OhSerialPort {
+public:
+    OhSerialPort(const std::string& aDevicePath, TUint aBaudRate = 9600);
+    ~OhSerialPort();
+
+    TBool Open();
+    void Close();
+    TBool IsOpen() const;
+
+    TBool Write(const Brx& aData, TUint aTimeoutMs = 1000);
+    TBool Read(Bwx& aBuffer, TUint aTimeoutMs = 1000);
+    TBool SendCommandAndWaitResponse(const Brx& aCommand, Bwx& aResponse, TUint aTimeoutMs = 1000);
+
+    void SetBaudRate(TUint aBaudRate);
+
+private:
+    speed_t GetBaudRateFlag(TUint aBaudRate);
+    void FlushInputBuffer();
+
+private:
+    int iFd;
+    std::string iDevicePath;
+    TUint iBaudRate;
+    struct termios iOldTermios;
+    TBool iIsOpen;
+    Mutex iMutex;
+};
+
+} // namespace Av
+} // namespace OpenHome
