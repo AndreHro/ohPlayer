@@ -1,8 +1,13 @@
 #include "OhLog.h"
 #include "TestMediaPlayer.h"
 #include "RaspdacMiniIF.h"
+#include "OhLinnAmpVolume.h"
+#include "LinnAmpConfig.h"
+#include "ConfigAppPlayerLinn.h"
 #include <OpenHome/Types.h>
 #include <OpenHome/Net/Private/DviStack.h>
+#include <cstdlib>
+#include <unistd.h>
 #include <OpenHome/Av/MediaPlayer.h>
 #include <OpenHome/Av/Product.h>
 #include <OpenHome/Net/Core/DvDevice.h>
@@ -22,6 +27,7 @@
 #include <OpenHome/Configuration/ConfigManager.h>
 #include <OpenHome/Configuration/Tests/ConfigRamStore.h>
 #include <OpenHome/Av/Utils/IconDriverSongcastSender.h>
+#include "IconOpenHome.h"
 #include <OpenHome/Private/Parser.h>
 #include <OpenHome/Media/Debug.h>
 #include <OpenHome/Av/Debug.h>
@@ -136,6 +142,9 @@ void VolumeSinkLogger::SetFade(TInt aFade)
 void RebootLogger::Reboot(const Brx& aReason)
 {
     Log::Print("\n\n\nRebootLogger::Reboot. Reason:\n%.*s\n\n\n", PBUF(aReason));
+    // Exit the process; systemd (ohPlayer.service, Restart=always) restarts it.
+    fflush(stdout);
+    _exit(0);
 }
 
 
@@ -189,6 +198,7 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
     , iUiSendQueueSize(aUiSendQueueSize)
     , iUiMsgBufCount(aUiMsgBufCount)
     , iUiMsgBufBytes(aUiMsgBufBytes)
+    , iLinnAmpVolume(nullptr)
 {
     Log::Print("Shell running on port %u\n", aDvStack.Env().Shell()->Port());
     iInfoLogger = std::make_unique<Media::AllocatorInfoLogger>();
@@ -244,9 +254,42 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
 
     VolumeProfile volumeProfile;
     VolumeConsumer volumeInit;
-    volumeInit.SetVolume(iVolumeLogger);
-    volumeInit.SetBalance(iVolumeLogger);
-    volumeInit.SetFade(iVolumeLogger);
+
+    // Read Linn Amp settings from the config store (web config)
+    Bws<LinnAmpConfig::kMaxSerialPortBytes> serialPortBuf;
+    TBool useLinnAmp = false;
+    LinnAmpConfig::ReadFromStore(*iConfigRamStore, serialPortBuf, useLinnAmp);
+    
+    // Use Linn Amp volume control if requested and serial port is provided
+    if (useLinnAmp && serialPortBuf.Bytes() > 0) {
+        std::string serialPortStr(reinterpret_cast<const char*>(serialPortBuf.Ptr()), serialPortBuf.Bytes());
+        const TUint volumeLimit = LinnAmpConfig::ReadVolumeLimitFromStore(*iConfigRamStore, 100);
+        iLinnAmpVolume = new OhLinnAmpVolume(serialPortStr, volumeLimit);
+        if (iLinnAmpVolume->IsVolumeSupported()) {
+            // Set the ALSA output to full scale: attenuation is handled by the Linn amp
+            iVolumeLogger.SetVolumeFixed(100 * 1024);
+            volumeInit.SetVolume(*iLinnAmpVolume);
+            volumeInit.SetBalance(*iLinnAmpVolume);
+            volumeInit.SetFade(*iLinnAmpVolume);
+            // Apply tone settings from the config store
+            const TInt bass = LinnAmpConfig::ReadToneFromStore(*iConfigRamStore, LinnAmpConfig::kKeyBass, 0);
+            const TInt treble = LinnAmpConfig::ReadToneFromStore(*iConfigRamStore, LinnAmpConfig::kKeyTreble, 0);
+            iLinnAmpVolume->SetBass(bass);
+            iLinnAmpVolume->SetTreble(treble);
+            Log::Print("Using Linn Amp volume control on %s\n", serialPortStr.c_str());
+        } else {
+            delete iLinnAmpVolume;
+            iLinnAmpVolume = nullptr;
+            volumeInit.SetVolume(iVolumeLogger);
+            volumeInit.SetBalance(iVolumeLogger);
+            volumeInit.SetFade(iVolumeLogger);
+            Log::Print("Linn Amp volume control failed, falling back to ALSA\n");
+        }
+    } else {
+        volumeInit.SetVolume(iVolumeLogger);
+        volumeInit.SetBalance(iVolumeLogger);
+        volumeInit.SetFade(iVolumeLogger);
+    }
 
     // Create MediaPlayer.
     // NOTE: If values for Room.Name and Product.Name already exist in the Store,
@@ -268,6 +311,9 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
                                    *iInfoLogger,
                                    aUdn, mpInit);
     delete mpInit;
+
+    // Register Linn Amp web config parameters (volume control choice and serial port)
+    iLinnAmpConfig = std::make_unique<LinnAmpConfig>(iMediaPlayer->ConfigInitialiser());
     
     iDriver = std::make_unique<DriverAlsa>(iMediaPlayer->Pipeline(), 22052);
 #if 1
@@ -291,6 +337,7 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
     // Register with the PowerManager
     IPowerManager& powerManager = iMediaPlayer->PowerManager();
     iPowerObserver = powerManager.RegisterPowerHandler(*this, kPowerPriorityLowest, "TestMediaPlayer");
+    iStandbyObserver = powerManager.RegisterStandbyHandler(*this, kStandbyHandlerPriorityNormal, "TestMediaPlayer");
     Log::Print("%s:%d\n", __FILE__, __LINE__);
     // Register Raspdac interface notification
     iRaspdacObserver = std::make_unique<RaspdacObserver>();
@@ -313,6 +360,11 @@ TestMediaPlayer::~TestMediaPlayer()
 {
     if (iDevice) {
         ASSERT(!iDevice->Enabled());
+    }
+
+    // Clean up Linn Amp volume control
+    if (iLinnAmpVolume != nullptr) {
+        delete iLinnAmpVolume;
     }
 
     // 2. Clean up dependencies before iStoreFileWriter and iConfigRamStore drop
@@ -586,11 +638,14 @@ void TestMediaPlayer::InitialiseSubsystems()
 IWebApp* TestMediaPlayer::CreateConfigApp(const std::vector<const Brx*>& aSources, const Brx& aResourceDir, TUint aMinWebUiResourceThreads, TUint aMaxWebUiTabs, TUint aMaxSendQueueSize, TUint aMsgBufCount, TUint aMsgBufBytes)
 {
     FileResourceHandlerFactory resourceHandlerFactory;
-    return new ConfigAppMediaPlayer(*iInfoLogger, iMediaPlayer->Env(), iMediaPlayer->Product(),
-                                    iMediaPlayer->ConfigManager(), resourceHandlerFactory, aSources,
-                                    Brn("Softplayer"), aResourceDir,
-                                    aMinWebUiResourceThreads, aMaxWebUiTabs, aMaxSendQueueSize,
-                                    aMsgBufCount, aMsgBufBytes, iRebootHandler);
+    Brn linnAmpModel(iLinnAmpVolume != nullptr ? iLinnAmpVolume->DeviceModel() : Brx::Empty());
+    Brn linnAmpSerial(iLinnAmpVolume != nullptr ? iLinnAmpVolume->DeviceId() : Brx::Empty());
+    return new ConfigAppPlayerLinn(*iInfoLogger, iMediaPlayer->Env(), iMediaPlayer->Product(),
+                                   iMediaPlayer->ConfigManager(), resourceHandlerFactory, aSources,
+                                   Brn("Softplayer"), aResourceDir,
+                                   aMinWebUiResourceThreads, aMaxWebUiTabs, aMaxSendQueueSize,
+                                   aMsgBufCount, aMsgBufBytes, iRebootHandler,
+                                   linnAmpModel, linnAmpSerial);
 }
 
 void TestMediaPlayer::InitialiseLogger()
@@ -612,8 +667,8 @@ void TestMediaPlayer::DestroyAppFramework()
 void TestMediaPlayer::WriteResource(const Brx& aUriTail, const TIpAddress& /*aInterface*/, std::vector<char*>& /*aLanguageList*/, IResourceWriter& aResourceWriter)
 {
     if (aUriTail == kSongcastSenderIconFileName) {
-        aResourceWriter.WriteResourceBegin(sizeof(kIconDriverSongcastSender), kIconDriverSongcastSenderMimeType);
-        aResourceWriter.WriteResource(kIconDriverSongcastSender, sizeof(kIconDriverSongcastSender));
+        aResourceWriter.WriteResourceBegin(sizeof(kIconOpenHome), kIconOpenHomeMimeType);
+        aResourceWriter.WriteResource(kIconOpenHome, sizeof(kIconOpenHome));
         aResourceWriter.WriteResourceEnd();
     }
 }
@@ -627,6 +682,26 @@ void TestMediaPlayer::PowerUp()
     //iDevice->SetEnabled();
     //iDeviceUpnpAv->SetEnabled();
     Log::Print("TestMediaPlayer::PowerUp\n");
+}
+
+void TestMediaPlayer::StandbyEnabled()
+{
+    Log::Print("TestMediaPlayer::StandbyEnabled\n");
+    if (iLinnAmpVolume != nullptr) {
+        iLinnAmpVolume->SetStandby(true);
+    }
+}
+
+void TestMediaPlayer::StandbyTransitioning()
+{
+}
+
+void TestMediaPlayer::StandbyDisabled(StandbyDisableReason /*aReason*/)
+{
+    Log::Print("TestMediaPlayer::StandbyDisabled\n");
+    if (iLinnAmpVolume != nullptr) {
+        iLinnAmpVolume->SetStandby(false);
+    }
 }
 
 void TestMediaPlayer::PowerDown()

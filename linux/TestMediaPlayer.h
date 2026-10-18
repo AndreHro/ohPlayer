@@ -3,6 +3,8 @@
 #include <OpenHome/Types.h>
 #include <OpenHome/Buffer.h>
 #include "VolumeControl.h"
+#include "OhLinnAmpVolume.h"
+#include "LinnAmpConfig.h"
 
 #include <OpenHome/Av/MediaPlayer.h>
 #include <OpenHome/Net/Core/DvDevice.h>
@@ -120,7 +122,7 @@ private: // from IRaatSignalPathObservable
     void RegisterObserver(IRaatSignalPathObserver& aObserver) override;
 };
 
-class TestMediaPlayer : private Net::IResourceManager, public IPowerHandler/*, public Web::IWebAppFramework*/
+class TestMediaPlayer : private Net::IResourceManager, public IPowerHandler, public IStandbyHandler/*, public Web::IWebAppFramework*/
 {
 private:
     static const Brn kSongcastSenderIconFileName;
@@ -141,7 +143,7 @@ public:
     TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack, const Brx& aUdn, const TChar* aRoom, const TChar* aProductName,
                     const Brx& aTuneInPartnerId, const Brx& aTidalId, const Brx& aQobuzIdSecret, const Brx& aUserAgent,
                     const TChar* aStoreFile, TUint aOdpPort=0, TUint aWebUiPort=0,
-                    TUint aMinWebUiResourceThreads=kMinWebUiResourceThreads, TUint aMaxWebUiTabs=kMaxWebUiTabs, TUint aUiSendQueueSize=kUiSendQueueSize, TUint aUiMsgBufCount=kUiMsgBufCount, TUint aUiMsgBufBytes=kUiMsgBufBytes);
+                    TUint aMinWebUiResourceThreads=kMinWebUiResourceThreads, TUint aMaxWebUiTabs=kMaxWebUiTabs, TUint aUiSendQueueSize=kUiSendQueueSize, TUint aUiMsgBufCount=kUiMsgBufCount, TUint aUiMsgBufBytes=kUiMsgBufBytes );
     virtual ~TestMediaPlayer();
     void RequestExit();
     void SetPullableClock(Media::IPullableClock& aPullableClock);
@@ -168,6 +170,10 @@ private: // from Net::IResourceManager
 private: // from IPowerHandler
     void PowerUp() override;
     void PowerDown() override;
+private: // from IStandbyHandler
+    void StandbyEnabled() override;
+    void StandbyTransitioning() override;
+    void StandbyDisabled(StandbyDisableReason aReason) override;
 //private: // from IWebAppFramework
 //    void Add(Web::IWebApp* aWebApp, FunctorPresentationUrl aFunctor) override;
 private:
@@ -196,6 +202,7 @@ private:
     Semaphore iSemShutdown;
     Semaphore iDisabled;
     IPowerManagerObserver* iPowerObserver;
+    IStandbyObserver* iStandbyObserver;
     const Brh iTuneInPartnerId;
     const Brh iTidalValues;
     const Brh iQobuzIdSecret;
@@ -222,6 +229,8 @@ private:
     TUint iUiSendQueueSize;
     TUint iUiMsgBufCount;
     TUint iUiMsgBufBytes;
+    OhLinnAmpVolume* iLinnAmpVolume;
+    std::unique_ptr<LinnAmpConfig> iLinnAmpConfig;
 
     std::unique_ptr<OpenHome::Media::DriverAlsa> iDriver;
     std::unique_ptr<Media::IPipelineObserver>    iRaspdacObserver;
