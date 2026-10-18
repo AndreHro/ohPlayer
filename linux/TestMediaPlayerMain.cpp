@@ -99,7 +99,7 @@ void TestMediaPlayerThread::RunInThread()
     // things going for the Hifiberry Digi+ card.
     //
     // FIXME This should be calculated.
-    driver = new DriverAlsa(tmp->Pipeline(), 22052);
+    driver = new DriverAlsa(tmp->Pipeline(), 22052, 0);
     if (driver == NULL)
     {
         Log::Print("%s:%d - Unable to start DriverAlsa\n", __FILE__, __LINE__);

@@ -12,7 +12,7 @@ BUILD_TYPE = Release
 OBJ_DIR    = $(OSPLATFORM)/objs
 
 # Core Compiler Optimization and Assembly Flags
-CFLAGS = -c -Wall -std=c++17 -O0 -g -DTARG_ARCH=$(TARG_ARCH) \
+CFLAGS = -c -Wall -std=c++17 -O0 -Wall -Wextra -g -DTARG_ARCH=$(TARG_ARCH) \
          -fstack-protector -fstack-check -DDEFINE_LITTLE_ENDIAN -fpermissive \
          $(shell pkg-config --cflags glib-2.0)
 

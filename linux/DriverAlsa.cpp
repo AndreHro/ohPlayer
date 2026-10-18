@@ -1,12 +1,14 @@
+#include "DriverAlsa.h"
+#include "SoxrProcessor.h"
+#include "IDataSink.h"
+#include "ConvertBELE.h"
 #include "OhLog.h"
-#include <OpenHome/Private/Printer.h>
-#include <OpenHome/Net/Private/Globals.h>
-#include <OpenHome/OsWrapper.h>
+
 #include <alsa/asoundlib.h>
 #include <memory>
-#include <vector>
+#include <atomic>
+#include <cerrno> 
 
-#include "DriverAlsa.h"
 
 using namespace OpenHome;
 using namespace OpenHome::Media;
@@ -38,538 +40,15 @@ TUint PriorityArbitratorDriver::HostRange() const
     return 1;
 }
 
-class IDataSink
-{
-public:
-    virtual void Write(const Brx& aData) = 0;
-    virtual     ~IDataSink() {}
-};
-
-// PcmProcessorBase
-
-class PcmProcessorBase : public IPcmProcessor
-{
-protected:
-    PcmProcessorBase(IDataSink& aDataSink, Bwx& aBuffer);
-public: // IPcmProcessor
-    virtual void BeginBlock() override;
-    void ProcessFragment(const Brx& aData, TUint aNumChannels, TUint aSubsampleBytes) override;
-    void ProcessSilence(const Brx& aData, TUint aNumChannels, TUint aSubsampleBytes) override;
-    virtual void EndBlock() override;
-    virtual void Flush() override;
-public:
-    void SetDuplicateChannel(TBool duplicateChannel);
-    void SetBitDepth(TUint bitDepth);
-protected:
-    void Append(const TByte* aData, TUint aBytes);
-    TByte* ConversionBuffer(TUint aBytes);
-
-    virtual void ProcessFragment8(const Brx& aData, TUint aNumChannels) = 0;
-    virtual void ProcessFragment16(const Brx& aData, TUint aNumChannels) = 0;
-    virtual void ProcessFragment24(const Brx& aData, TUint aNumChannels) = 0;
-    virtual void ProcessFragment32(const Brx& aData, TUint aNumChannels) = 0;
-protected:
-    IDataSink& iSink;
-    Bwx&       iBuffer;
-    std::vector<TByte> iConversionBuffer;
-    TBool      iDuplicateChannel;
-    TUint      iBitDepth;
-};
-
-PcmProcessorBase::PcmProcessorBase(IDataSink& aDataSink, Bwx& aBuffer)
-: iSink(aDataSink)
-, iBuffer(aBuffer)
-, iDuplicateChannel(false)
-, iBitDepth(0)
-{
-}
-
-void PcmProcessorBase::SetDuplicateChannel(TBool duplicateChannel)
-{
-    iDuplicateChannel = duplicateChannel;
-}
-
-void PcmProcessorBase::SetBitDepth(TUint bitDepth)
-{
-    iBitDepth = bitDepth;
-}
-
-TByte* PcmProcessorBase::ConversionBuffer(TUint aBytes)
-{
-    if (iConversionBuffer.size() < aBytes) {
-        iConversionBuffer.resize(aBytes);
-    }
-    return iConversionBuffer.data();
-}
-
-void PcmProcessorBase::Append(const TByte* aData, TUint aBytes)
-{
-    if (iBuffer.BytesRemaining() < aBytes)
-        Flush();
-
-    iBuffer.Append(aData, aBytes);
-}
-
-void PcmProcessorBase::Flush()
-{
-    if (iBuffer.Bytes() != 0)
-    {
-        iSink.Write(iBuffer);
-        iBuffer.SetBytes(0);
-    }
-}
-
-void PcmProcessorBase::BeginBlock()
-{
-    ASSERT(iBuffer.Bytes() == 0);
-}
-
-void PcmProcessorBase::EndBlock()
-{
-    Flush();
-}
-
-void PcmProcessorBase::ProcessSilence(const Brx& aData, 
-                                      TUint aNumChannels,
-                                      TUint aNumSampleBytes)
-{
-    ProcessFragment(aData, aNumChannels, aNumSampleBytes);
-}
-
-void PcmProcessorBase::ProcessFragment(const Brx& aData,
-                                       TUint aNumChannels,
-                                       TUint /*aNumSampleBytes*/)
-{
-    switch (iBitDepth)
-    {
-        case 8: {
-            ProcessFragment8(aData, aNumChannels);
-            break;
-        }
-        case 16: {
-            ProcessFragment16(aData, aNumChannels);
-            break;
-        }
-        case 24: {
-            ProcessFragment24(aData, aNumChannels);
-            break;
-        }
-        case 32: {
-            ProcessFragment32(aData, aNumChannels);
-            break;
-        }
-        default: {
-            ASSERT_VA(false, "%s", "Unknown bit depth.");
-            break; // NOT REACHED
-        }
-    }
-
-}
-
-
-// PcmProcessorLe
-
-class PcmProcessorLe : public PcmProcessorBase
-{
-public:
-    PcmProcessorLe(IDataSink& aSink, Bwx& aBuffer);
-public: // IPcmProcessor
-    virtual void ProcessFragment8(const Brx& aData, TUint aNumChannels);
-    virtual void ProcessFragment16(const Brx& aData, TUint aNumChannels);
-    virtual void ProcessFragment24(const Brx& aData, TUint aNumChannels);
-    virtual void ProcessFragment32(const Brx& aData, TUint aNumChannels);
-};
-
-PcmProcessorLe::PcmProcessorLe(IDataSink& aSink, Bwx& aBuffer)
-: PcmProcessorBase(aSink, aBuffer)
-{
-}
-
-void PcmProcessorLe::ProcessFragment8(const Brx& aData, TUint aNumChannels)
-{
-    TByte *nData;
-    TUint  bytes;
-
-    // The input data is converted from unsigned 8 bit to signed 16 bit.
-    // to removes poor audio quality and glitches when part of a playlist
-    // with tracks of a different bit depth.
-    //
-    // Accordingly the amount of data is doubled.
-    bytes = aData.Bytes() * 2;
-
-    // If we are manually converting mono to stereo the data will double.
-    if (iDuplicateChannel)
-    {
-        bytes *= 2;
-    }
-
-    nData = ConversionBuffer(bytes);
-
-    TByte *ptr  = (TByte *)(aData.Ptr() + 0);
-    TByte *ptr1 = (TByte *)nData;
-    TByte *endp = ptr1 + bytes;
-
-    while (ptr1 < endp)
-    {
-        // Convert U8 to S16 data in little endian format.
-        *ptr1++ = 0x00;
-        *ptr1++ = *ptr - 0x80;
-
-        if (iDuplicateChannel)
-        {
-            *ptr1++ = 0x00;
-            *ptr1++ = *ptr - 0x80;
-        }
-
-        ptr++;
-    }
-
-    Brn fragment(nData, bytes);
-    Flush();
-    iSink.Write(fragment);
-}
-
-void PcmProcessorLe::ProcessFragment16(const Brx& aData, TUint aNumChannels)
-{
-    TByte *nData;
-    TUint  bytes;
-
-    bytes = aData.Bytes();
-
-    // If we are manually converting mono to stereo the data will double.
-    if (iDuplicateChannel)
-    {
-        bytes *= 2;
-    }
-
-    nData = ConversionBuffer(bytes);
-
-    TByte *ptr  = (TByte *)(aData.Ptr() + 0);
-    TByte *ptr1 = (TByte *)nData;
-    TByte *endp = ptr1 + bytes;
-
-    ASSERT(bytes % 2 == 0);
-
-    while (ptr1 < endp)
-    {
-        // Store the S16 data in little endian format.
-        *ptr1++ = *(ptr+1);
-        *ptr1++ = *(ptr);
-
-        if (iDuplicateChannel)
-        {
-            *ptr1++ = *(ptr+1);
-            *ptr1++ = *(ptr);
-        }
-
-        ptr +=2;
-    }
-
-    Brn fragment(nData, bytes);
-    Flush();
-    iSink.Write(fragment);
-}
-
-void PcmProcessorLe::ProcessFragment24(const Brx& aData, TUint aNumChannels)
-{
-    TByte *nData;
-    TUint  bytes;
-
-    // 24 bit audio is not supported on the platform so it is converted
-    // to signed 16 bit audio for playback.
-    //
-    // Accordingly one third of the input data is discarded.
-    bytes = (aData.Bytes() * 2) / 3;
-
-    // If we are manually converting mono to stereo the data will double.
-    if (iDuplicateChannel)
-    {
-        bytes *= 2;
-    }
-
-    nData = ConversionBuffer(bytes);
-
-    TByte *ptr  = (TByte *)(aData.Ptr() + 0);
-    TByte *ptr1 = (TByte *)nData;
-    TByte *endp = ptr1 + bytes;
-
-    ASSERT(bytes % 2 == 0);
-
-    while (ptr1 < endp)
-    {
-        // Store the data in little endian format.
-        *ptr1++ = *(ptr+1);
-        *ptr1++ = *(ptr+0);
-
-        if (iDuplicateChannel)
-        {
-            *ptr1++ = *(ptr+1);
-            *ptr1++ = *(ptr+0);
-        }
-
-        ptr += 3;
-    }
-
-    Brn fragment(nData, bytes);
-    Flush();
-    iSink.Write(fragment);
-}
-
-void PcmProcessorLe::ProcessFragment32(const Brx& aData, TUint aNumChannels)
-{
-    TByte *nData;
-    TUint  bytes;
-
-    // Currently the only 32 bit pcm in the pipeline is auto-generated by
-    // the ramper.
-    //
-    // This may differ from the stream format so we must do the conversion
-    // here.
-    bytes = aData.Bytes();
-
-    // If we are manually converting mono to stereo the data will double.
-    //
-    // aNumChannels must be checked as the ramper can inject 32 bit
-    // stereo into the pipeline.
-    if (iDuplicateChannel && (aNumChannels != 2))
-    {
-        bytes *= 2;
-    }
-
-    nData = ConversionBuffer(bytes);
-
-    TByte *ptr  = (TByte *)(aData.Ptr() + 0);
-    TByte *endp = ptr + aData.Bytes();
-    TByte *ptr1 = (TByte *)nData;
-
-    TUint outBytes = 0;
-
-    while (ptr < endp)
-    {
-        switch (iBitDepth)
-        {
-            // The system only supports upto 16 bit.
-            //
-            // Convert everything above that to 16 bit.
-            case 32:
-            // Fallthrough
-            case 24:
-            // Fallthrough
-            case 16:
-            {
-                // Store the data in little endian format.
-                *ptr1++ = *(ptr+1);
-                *ptr1++ = *(ptr+0);
-                outBytes += 2;
-
-                if (iDuplicateChannel && (aNumChannels != 2))
-                {
-                    *ptr1++ = *(ptr+1);
-                    *ptr1++ = *(ptr+0);
-                    outBytes += 2;
-                }
-
-                break;
-            }
-            // The platform is configured for 8 bit. Convert.
-            case 8:
-            {
-                // Convert S32 to S8 by taking the most significant 8 bits
-                TInt32 sample = *reinterpret_cast<TInt32*>(ptr);
-                sample = sample >> 24;
-                *ptr1++ = static_cast<TByte>(sample);
-                outBytes += 1;
-
-                if (iDuplicateChannel && (aNumChannels != 2))
-                {
-                    *ptr1++ = static_cast<TByte>(sample);
-                    outBytes += 1;
-                }
-
-                break;
-            }
-        }
-
-        ptr += 4;
-    }
-
-    Brn fragment(nData, outBytes);
-    Flush();
-    iSink.Write(fragment);
-}
-
-// PcmProcessorLe32
-
-class PcmProcessorLe32 : public PcmProcessorLe
-{
-public:
-    PcmProcessorLe32(IDataSink& aSink, Bwx& aBuffer);
-public: // IPcmProcessor
-    void ProcessFragment24(const Brx& aData, TUint aNumChannels);
-    void ProcessFragment32(const Brx& aData, TUint aNumChannels);
-};
-
-PcmProcessorLe32::PcmProcessorLe32(IDataSink& aSink, Bwx& aBuffer)
-: PcmProcessorLe(aSink, aBuffer)
-{
-}
-
-void PcmProcessorLe32::ProcessFragment24(const Brx& aData, TUint aNumChannels)
-{
-    TByte *nData;
-    TUint  bytes;
-
-    // 24 bit audio is not supported on the platform so it is converted
-    // to signed 32 bit audio for playback.
-    //
-    // Accordingly we allocate room for 4 byte samples.
-    bytes = (aData.Bytes() * 4) / 3;
-
-    // If we are manually converting mono to stereo the data will double.
-    if (iDuplicateChannel)
-    {
-        bytes *= 2;
-    }
-
-    nData = ConversionBuffer(bytes);
-
-    TByte *ptr  = (TByte *)(aData.Ptr() + 0);
-    TByte *ptr1 = (TByte *)nData;
-    TByte *endp = ptr1 + bytes;
-
-    ASSERT(bytes % 4 == 0);
-
-    while (ptr1 < endp)
-    {
-        // Store the data in little endian format.
-        *ptr1++ = 0;
-        *ptr1++ = *(ptr+2);
-        *ptr1++ = *(ptr+1);
-        *ptr1++ = *(ptr+0);
-
-        if (iDuplicateChannel)
-        {
-            *ptr1++ = 0;
-            *ptr1++ = *(ptr+2);
-            *ptr1++ = *(ptr+1);
-            *ptr1++ = *(ptr+0);
-        }
-
-        ptr += 3;
-    }
-
-    Brn fragment(nData, bytes);
-    Flush();
-    iSink.Write(fragment);
-}
-
-void PcmProcessorLe32::ProcessFragment32(const Brx& aData, TUint aNumChannels)
-{
-    TByte *nData;
-    TUint  bytes;
-
-    // Currently the only 32 bit pcm in the pipeline is auto-generated by
-    // the ramper.
-    //
-    // This may differ from the stream format so we must do the conversion
-    // here.
-    bytes = aData.Bytes();
-
-    // If we are manually converting mono to stereo the data will double.
-    //
-    // aNumChannels must be checked as the ramper can inject 32 bit
-    // stereo into the pipeline.
-    if (iDuplicateChannel && (aNumChannels != 2))
-    {
-        bytes *= 2;
-    }
-
-    nData = ConversionBuffer(bytes);
-
-    TByte *ptr  = (TByte *)(aData.Ptr() + 0);
-    TByte *endp = ptr + aData.Bytes();
-    TByte *ptr1 = (TByte *)nData;
-
-    TUint outBytes = 0;
-
-    while (ptr < endp)
-    {
-        switch (iBitDepth)
-        {
-            // The platform supports and is configured for 32 bit audio.
-            case 32:
-            // Fallthrough
-            case 24:
-            {
-                *ptr1++ = *(ptr+3);
-                *ptr1++ = *(ptr+2);
-                *ptr1++ = *(ptr+1);
-                *ptr1++ = *(ptr+0);
-                outBytes += 4;
-
-                if (iDuplicateChannel && (aNumChannels != 2))
-                {
-                    *ptr1++ = *(ptr+3);
-                    *ptr1++ = *(ptr+2);
-                    *ptr1++ = *(ptr+1);
-                    *ptr1++ = *(ptr+0);
-                    outBytes += 4;
-                }
-
-                break;
-            }
-            // The platform is configured for 16 bit. Convert.
-            case 16:
-            {
-                *ptr1++ = *(ptr+1);
-                *ptr1++ = *(ptr+0);
-                outBytes += 2;
-
-                if (iDuplicateChannel && (aNumChannels != 2))
-                {
-                    *ptr1++ = *(ptr+1);
-                    *ptr1++ = *(ptr+0);
-                    outBytes += 2;
-                }
-
-                break;
-            }
-            // The platform is configured for 8 bit. Convert.
-            case 8:
-            {
-                // Convert S32 to S8 by taking the most significant 8 bits
-                TInt32 sample = *reinterpret_cast<TInt32*>(ptr);
-                sample = sample >> 24;
-                *ptr1++ = static_cast<TByte>(sample);
-                outBytes += 1;
-
-                if (iDuplicateChannel && (aNumChannels != 2))
-                {
-                    *ptr1++ = static_cast<TByte>(sample);
-                    outBytes += 1;
-                }
-
-                break;
-            }
-        }
-
-        ptr += 4;
-    }
-
-    Brn fragment(nData, outBytes);
-    Flush();
-    iSink.Write(fragment);
-}
-
-typedef std::pair<snd_pcm_format_t, TUint> OutputFormat;
+using OutputFormat=std::pair<snd_pcm_format_t, TUint>;
 
 class Profile
 {
 public:
-    Profile(IPcmProcessor* aPcmProcessor, OutputFormat aFormat32,
-                                          OutputFormat aFormat24,
-                                          OutputFormat aFormat16,
-                                          OutputFormat aFormat8);
+    Profile(std::unique_ptr<IPcmProcessor> aPcmProcessor, OutputFormat aFormat32,
+                                                          OutputFormat aFormat24,
+                                                          OutputFormat aFormat16,
+                                                          OutputFormat aFormat8);
 public:
     OutputFormat   GetFormat(TUint aBitDepth) const;
     IPcmProcessor& GetPcmProcessor() const;
@@ -578,11 +57,11 @@ private:
     OutputFormat                   iOutputDesc[4];
 };
 
-Profile::Profile(IPcmProcessor* aPcmProcessor, OutputFormat aFormat32,
-                                               OutputFormat aFormat24,
-                                               OutputFormat aFormat16,
-                                               OutputFormat aFormat8)
-: iPcmProcessor(aPcmProcessor)
+Profile::Profile(std::unique_ptr<IPcmProcessor> aPcmProcessor, OutputFormat aFormat32,
+                                                               OutputFormat aFormat24,
+                                                               OutputFormat aFormat16,
+                                                               OutputFormat aFormat8)
+: iPcmProcessor(std::move(aPcmProcessor))
 {
     iOutputDesc[0] = aFormat32;
     iOutputDesc[1] = aFormat24;
@@ -610,6 +89,7 @@ OutputFormat Profile::GetFormat(TUint aBitDepth) const
 
 IPcmProcessor& Profile::GetPcmProcessor() const
 {
+    assert(iPcmProcessor != nullptr);
     return *iPcmProcessor;
 }
 
@@ -619,28 +99,29 @@ IPcmProcessor& Profile::GetPcmProcessor() const
     and plays it.
 */
 
-class DriverAlsa::Pimpl : public IDataSink
+class DriverAlsaPimpl final : public IDriverBackend, public IDataSink
 {
 public:
-    Pimpl(const TChar* aAlsaDevice, TUint aBufferUs);
-    virtual ~Pimpl();
-    void ProcessDecodedStream(MsgDecodedStream* aMsg);
-    void ProcessPlayable(MsgPlayable* aMsg);
-    void ProcessDrain();
+    DriverAlsaPimpl(const Brx& aAlsaDevice, TUint aBufferUs, TUint aOutputSampleRate);
+    virtual ~DriverAlsaPimpl();
+    void ProcessDecodedStream(MsgDecodedStream* aMsg) override;
+    void ProcessPlayable(MsgPlayable* aMsg) override;
+    void ProcessDrain() override;
+    void ProcessMode() override;
     void LogPCMState();
-    TUint DriverDelayJiffies(TUint aSampleRate);
+    TUint DriverDelayJiffies(TUint aSampleRate) override;
 public:
-    virtual void Write(const Brx& aData);
+    void Write(const Brx& aData) override;
+    void WritePcmDirect(const Brx& aData, TUint aNumChannels, TUint aSubsampleBytes);
 private:
     TBool TryProfile(Profile& aProfile, TUint aBitDepth, TUint aNumChannels,
                      TUint aSampleRate, TUint aBufferUs);
 private:
-    snd_pcm_t* iHandle;
+    snd_pcm_t* iHandle{nullptr};
     Bwh iSampleBuffer;  // buffer ProcessSampleX data
     TUint iSampleBytes;
     TBool iDuplicateChannel;
-    std::vector<Profile> iProfiles;
-    TInt iProfileIndex;
+    std::unique_ptr<Profile> iProfile;
     TBool iDitch;
     TUint iBytesSent;
     TUint iXrunCount;
@@ -648,80 +129,104 @@ private:
     TUint iWaitCount;
     TUint iBufferUs;
 
+    TUint iOutputSampleRate;
+    std::atomic<TUint> iCurrentOutputRate{0};
+
+    std::vector<TInt32> iTmpOut;
+    std::vector<TByte>  iS32ConversionBuffer;
+
     static const TUint kSampleBufSize = 16 * 1024;
 };
 
-DriverAlsa::Pimpl::Pimpl(const TChar* aAlsaDevice, TUint aBufferUs)
+DriverAlsaPimpl::DriverAlsaPimpl(const Brx& aAlsaDevice, TUint aBufferUs, TUint aOutputSampleRate)
 : iHandle(nullptr)
 , iSampleBuffer(kSampleBufSize)
 , iSampleBytes(0)
 , iDuplicateChannel(false)
-, iProfileIndex(-1)
+, iProfile(nullptr)
 , iDitch(false)
 , iBytesSent(0)
 , iXrunCount(0)
 , iRecoverCount(0)
 , iWaitCount(0)
 , iBufferUs(aBufferUs)
+, iOutputSampleRate(aOutputSampleRate)
+, iCurrentOutputRate(aOutputSampleRate)
 {
-    auto err = snd_pcm_open(&iHandle, aAlsaDevice, SND_PCM_STREAM_PLAYBACK, 0);
-    ASSERT(err == 0);
+    const Brhz devName(aAlsaDevice);
+    OhLog::Print("DriverAlsa: Opening ALSA device %s\n", devName.CString());
+    const int err = snd_pcm_open(&iHandle, devName.CString(), SND_PCM_STREAM_PLAYBACK, 0);
 
-    // PcmProcessorLe with S32 support
-    iProfiles.emplace_back(new PcmProcessorLe32(*this, iSampleBuffer),
-            OutputFormat(SND_PCM_FORMAT_S32_LE, 4),  // S32 -> S32
-            OutputFormat(SND_PCM_FORMAT_S32_LE, 4),  // S24 -> S32
-            OutputFormat(SND_PCM_FORMAT_S16_LE, 2),  // S16
-            OutputFormat(SND_PCM_FORMAT_S16_LE, 2)); // U8 -> S16
+    if (err < 0) {
+        OhLog::PrintError(
+            "DriverAlsa: snd_pcm_open() failed: %s\n", snd_strerror(err));
+        iHandle = nullptr;
+        iDitch = true;
+        return;
+    }
 
-    // PcmProcessorLe without S32 support
-    iProfiles.emplace_back(new PcmProcessorLe(*this, iSampleBuffer),
-            OutputFormat(SND_PCM_FORMAT_S16_LE, 2),  // S32 -> S16
-            OutputFormat(SND_PCM_FORMAT_S16_LE, 2),  // S24 -> S16
-            OutputFormat(SND_PCM_FORMAT_S16_LE, 2),  // S16
-            OutputFormat(SND_PCM_FORMAT_S16_LE, 2)); // U8 -> S16
+    AudioSpec initialSpec{};
+    initialSpec.iNumChannels = 2;
+    initialSpec.iBitDepth = 32;
+    initialSpec.iInputRate = 44100.0;
+    initialSpec.iOutputRate = aOutputSampleRate != 0 ? aOutputSampleRate : 44100.0;
+
+    auto pcmProcessor = std::make_unique<SoxrPcmProcessor>(*this, iSampleBuffer, initialSpec);
+    iProfile = std::make_unique<Profile>(
+        std::move(pcmProcessor),
+        OutputFormat(SND_PCM_FORMAT_S32_LE, 4),
+        OutputFormat(SND_PCM_FORMAT_S32_LE, 4),
+        OutputFormat(SND_PCM_FORMAT_S32_LE, 4),
+        OutputFormat(SND_PCM_FORMAT_S32_LE, 4));   
 }
 
-DriverAlsa::Pimpl::~Pimpl()
+DriverAlsaPimpl::~DriverAlsaPimpl()
 {
-    auto err = snd_pcm_close(iHandle);
-    ASSERT(err == 0);
-}
-
-void DriverAlsa::Pimpl::ProcessPlayable(MsgPlayable* aMsg)
-{
-    if (! iDitch)
-    	aMsg->Read(iProfiles[iProfileIndex].GetPcmProcessor());
-}
-
-void DriverAlsa::Pimpl::ProcessDrain()
-{
-    // Wait for the native audio buffers to empty.
-    if (iProfileIndex != -1)
-    {
-        // Drain the PCM buffers.
-        auto err = snd_pcm_drain(iHandle);
-        if (err < 0)
-        {
-            OhLog::PrintError("DriverAlsa: snd_pcm_drain() error : %s\n",
-                       snd_strerror(err));
-            ASSERTS();
-        }
-
-        // Prepare the PCM to accept new data.
-        err = snd_pcm_prepare(iHandle);
-
-        if (err < 0)
-        {
-            OhLog::PrintError("DriverAlsa: snd_pcm_prepare() error : %s\n",
-                       snd_strerror(err));
-            ASSERTS();
-        }
+    if (iHandle != nullptr) {
+        const int err = snd_pcm_close(iHandle);
+        ASSERT(err == 0);
+        iHandle = nullptr;
     }
 }
-#if 1
-void DriverAlsa::Pimpl::Write(const Brx& aData)
+
+void DriverAlsaPimpl::ProcessPlayable(MsgPlayable* aMsg)
 {
+    if (iProfile == nullptr || iDitch) {
+        return;
+    }
+    auto & pcmProcessor = iProfile->GetPcmProcessor();
+    aMsg->Read(pcmProcessor);
+}
+
+void DriverAlsaPimpl::ProcessDrain()
+{
+    if (iProfile == nullptr || iHandle == nullptr) {
+        return;
+    }
+    // Flush the resampler before ALSA is drained.
+    iProfile->GetPcmProcessor().Flush();
+
+    auto err = snd_pcm_drain(iHandle);
+    if (err < 0) {
+        OhLog::PrintError("DriverAlsa: snd_pcm_drain() error: %s\n",
+                          snd_strerror(err));
+        snd_pcm_drop(iHandle);
+    }
+
+    err = snd_pcm_prepare(iHandle);
+    if (err < 0) {
+        OhLog::PrintError("DriverAlsa: snd_pcm_prepare() error: %s\n",
+                          snd_strerror(err));
+        snd_pcm_recover(iHandle, err, 1);
+    }
+}
+
+void DriverAlsaPimpl::Write(const Brx& aData)
+{
+    if (iHandle == nullptr) {
+        return;
+    }
+
     if (iSampleBytes == 0) {
         OhLog::PrintError("DriverAlsa: invalid sample size");
         return;
@@ -738,25 +243,37 @@ void DriverAlsa::Pimpl::Write(const Brx& aData)
 
     const TByte* ptr = aData.Ptr();
     snd_pcm_uframes_t framesRemaining = aData.Bytes() / iSampleBytes;
+    
+    TUint recoveryAttempts = 0;
+    TUint retryTimeouts = 0;
+    const TUint kMaxRecoveryAttempts = 5;
 
     while (framesRemaining > 0) {
-        snd_pcm_sframes_t framesWritten =
-            snd_pcm_writei(iHandle, ptr, framesRemaining);
+        snd_pcm_sframes_t framesWritten = snd_pcm_writei(iHandle, ptr, framesRemaining);
 
+        // 1. Handle Errors Gracefully
         if (framesWritten < 0) {
-            const int writeError = static_cast<int>(framesWritten);
-
-            if (writeError == -EPIPE) {
-                ++iXrunCount;
-                OhLog::PrintWarning("DriverAlsa: XRUN detected (count=%u)",
-                                    iXrunCount);
+            if (framesWritten == -ENODEV || framesWritten == -ESHUTDOWN) {
+                OhLog::PrintError("DriverAlsa: Sound card disconnected. Dropping frame payload.\n");
+                return; 
             }
 
-            const int err = snd_pcm_recover(iHandle, writeError, 1);
+            // Log if it's a standard buffer underrun (Xrun)
+            if (framesWritten == -EPIPE) {
+                OhLog::PrintWarning("DriverAlsa: Buffer underrun (Xrun) detected. Attempting recovery...\n");
+            }
 
+            // Attempt to restore the hardware state
+            const int err = snd_pcm_recover(iHandle, framesWritten, 1);
             if (err < 0) {
-                OhLog::PrintError("DriverAlsa: snd_pcm_writei() unrecoverable error: %s",
-                                  snd_strerror(err));
+                OhLog::PrintError("DriverAlsa: snd_pcm_recover failed: %s\n", snd_strerror(err));
+                return; // Break out immediately to protect the pipeline thread
+            }
+
+            // Protect against infinite loop lockups if recovery keeps looping
+            recoveryAttempts++;
+            if (recoveryAttempts > kMaxRecoveryAttempts) {
+                OhLog::PrintError("DriverAlsa: Unrecoverable recovery loop cascade. Dropping block.\n");
                 return;
             }
 
@@ -766,62 +283,81 @@ void DriverAlsa::Pimpl::Write(const Brx& aData)
                        iRecoverCount);
             continue;
         }
-
         if (framesWritten == 0) {
-            ++iWaitCount;
-            const int err = snd_pcm_wait(iHandle, 1000);
+            const int err = snd_pcm_wait(iHandle, 500);
 
             if (err < 0) {
-                OhLog::PrintError("DriverAlsa: snd_pcm_wait() error: %s",
-                                  snd_strerror(err));
+                OhLog::PrintError(
+                    "DriverAlsa: snd_pcm_wait() error: %s\n",
+                    snd_strerror(err));
                 return;
+            }
+
+            if (err == 0) {
+                ++retryTimeouts;
+
+                if (retryTimeouts > kMaxRecoveryAttempts) {
+                    OhLog::PrintError(
+                        "DriverAlsa: Repeated ALSA wait timeouts. "
+                        "Dropping block.\n");
+                    return;
+                }
+            }
+            else {
+                retryTimeouts = 0;
             }
 
             continue;
         }
 
-        ptr += framesWritten * iSampleBytes;
-        framesRemaining -= framesWritten;
-        iBytesSent += framesWritten * iSampleBytes;
+        const auto framesConsumed = static_cast<snd_pcm_uframes_t>(framesWritten);
+        const TUint bytesConsumed = framesConsumed * iSampleBytes;
+        ptr += bytesConsumed;
+        framesRemaining -= framesConsumed;
+        iBytesSent += bytesConsumed;
+        recoveryAttempts = 0;
+        retryTimeouts = 0;
     }
 }
-#else
-void DriverAlsa::Pimpl::Write(const Brx& aData)
+
+void DriverAlsaPimpl::WritePcmDirect(const Brx& aData, TUint aNumChannels, TUint aSubsampleBytes)
 {
-    int err;
-
-    err = snd_pcm_writei(iHandle, aData.Ptr(), aData.Bytes() / iSampleBytes);
-
-    // Handle underrun errors.
-    if(err == -EPIPE) {
-        err = snd_pcm_prepare(iHandle);
-
-        if (err < 0)
-        {
-            OhLog::PrintError("DriverAlsa: failed to snd_pcm_recover with %s\n",
-                       snd_strerror(err));
-            ASSERTS();
-        }
-
-        err = snd_pcm_writei(iHandle,
-                             aData.Ptr(),
-                             aData.Bytes() / iSampleBytes);
+    if (iSampleBytes == 0) {
+        OhLog::PrintError("DriverAlsa: invalid sample size\n");
+        return;
     }
 
+    const TUint inputBytes = aData.Bytes();
+    const TUint bytesPerFrame = aNumChannels * aSubsampleBytes;
+    const TUint frames = inputBytes / bytesPerFrame;
+    if (frames == 0) {
+        return;
+    }
 
-    if (err < 0)
-    {
-        OhLog::PrintError("DriverAlsa: snd_pcm_writei() got error %s\n",
-                   snd_strerror(err));
+    const TUint totalSamples = frames * aNumChannels;
+    const TUint outputBytes = totalSamples * sizeof(TInt32);
+
+    if (iS32ConversionBuffer.size() < outputBytes) {
+        iS32ConversionBuffer.resize(outputBytes);
     }
-    else
-    {
-        iBytesSent += aData.Bytes();
-    }
+
+    OpenHome::Media::ConvertInterleavedToS32LE_With24Simd(
+        aData.Ptr(),
+        inputBytes,
+        iS32ConversionBuffer.data(),
+        frames,
+        aNumChannels,
+        aSubsampleBytes,
+        false /* OH PIPELINE IS ALWAYS BE */,
+        iDuplicateChannel && aNumChannels == 1,
+        iTmpOut);
+
+    const Brn converted(iS32ConversionBuffer.data(), outputBytes);
+    Write(converted);
 }
-#endif
+
 #ifdef DEBUG
-void DriverAlsa::Pimpl::LogPCMState()
+void DriverAlsaPimpl::LogPCMState()
 {
     switch (snd_pcm_state(iHandle))
     {
@@ -859,26 +395,22 @@ void DriverAlsa::Pimpl::LogPCMState()
 }
 #endif
 
-void DriverAlsa::Pimpl::ProcessDecodedStream(MsgDecodedStream* aMsg)
+void DriverAlsaPimpl::ProcessDecodedStream(MsgDecodedStream* aMsg)
 {
-    if (iProfileIndex != -1)
-    {
-        // Drain and stop the PCM.
-        auto err = snd_pcm_drain(iHandle);
-        if (err < 0)
-        {
-            OhLog::PrintError("DriverAlsa: snd_pcm_drain() error : %s\n",
-                       snd_strerror(err));
-            ASSERTS();
-        }
+    if (iProfile == nullptr) {
+        iDitch = true;
+        iSampleBytes = 0;
+        return;
     }
 
-    Log::Print("DriverAlsa: previous stream stats: "
-               "bytes=%u xruns=%u recoveries=%u waits=%u\n",
-               iBytesSent,
-               iXrunCount,
-               iRecoverCount,
-               iWaitCount);
+    if (iSampleBytes != 0) {
+        ProcessDrain();
+    }
+
+    const auto & decodedStreamInfo = aMsg->StreamInfo();
+
+    Log::Print("DriverAlsa: Bytes Sent since last MsgDecodedStream = %u\n",
+               iBytesSent);
 
     iBytesSent = 0;
     iXrunCount = 0;
@@ -887,8 +419,8 @@ void DriverAlsa::Pimpl::ProcessDecodedStream(MsgDecodedStream* aMsg)
 
     auto decodedStreamInfo = aMsg->StreamInfo();
 
-    Log::Print("DriverAlsa: Finding PcmProcessor for stream: BitDepth = %d, "
-               "SampleRate = %d, Channels = %d\n",
+    Log::Print("DriverAlsa: Finding PcmProcessor for stream: BitDepth = %u, "
+               "SampleRate = %u, Channels = %u\n",
                decodedStreamInfo.BitDepth(), decodedStreamInfo.SampleRate(),
                decodedStreamInfo.NumChannels());
 
@@ -906,61 +438,68 @@ void DriverAlsa::Pimpl::ProcessDecodedStream(MsgDecodedStream* aMsg)
         iDuplicateChannel = false;
     }
 
-    for (TUint i = 0; i < iProfiles.size(); ++i)
-    {
-        if (TryProfile(iProfiles[i], decodedStreamInfo.BitDepth(),
-                       decodedStreamInfo.NumChannels(),
-                       decodedStreamInfo.SampleRate(), iBufferUs))
-        {
-            iProfileIndex = i;
+    const TUint outputRate = iOutputSampleRate ? iOutputSampleRate
+                                                : decodedStreamInfo.SampleRate();
+    iCurrentOutputRate.store(outputRate);
 
-            PcmProcessorBase& pcmP =
-                (PcmProcessorBase&)iProfiles[i].GetPcmProcessor();
-            pcmP.SetDuplicateChannel(iDuplicateChannel);
-            pcmP.SetBitDepth(decodedStreamInfo.BitDepth());
-
-            iSampleBytes =
-                decodedStreamInfo.NumChannels() *
-                iProfiles[i].GetFormat(decodedStreamInfo.BitDepth()).second;
-
-            // If we manually converting mono to stereo the sample size doubles.
-            if (iDuplicateChannel)
-            {
-                iSampleBytes *= 2;
-            }
-
-            iDitch = false;
-
-            Log::Print("Found PcmProcessor %d\n", iProfileIndex);
-
-            return;
-        }
+    const TUint bitDepth = decodedStreamInfo.BitDepth();
+    if (!TryProfile(*iProfile, bitDepth, decodedStreamInfo.NumChannels(),
+                    outputRate, iBufferUs)) {
+        Log::Print("DriverAlsa: No usable ALSA profile for stream: BitDepth = %u, "
+                   "SampleRate = %u, Channels = %u\n",
+                   bitDepth, decodedStreamInfo.SampleRate(),
+                   decodedStreamInfo.NumChannels());
+        iSampleBytes = 0;
+        iDitch = true;
+        return;
     }
 
-    OhLog::PrintWarning("DriverAlsa: Could not find a PcmProcessor for stream! "
-               "BitDepth = %d, SampleRate = %d, Channels = %d\n",
-               decodedStreamInfo.BitDepth(), decodedStreamInfo.SampleRate(),
-               decodedStreamInfo.NumChannels());
+    SoxrPcmProcessor& pcmProcessor =
+        static_cast<SoxrPcmProcessor&>(iProfile->GetPcmProcessor());
+    AudioSpec spec{};
+    spec.iNumChannels = decodedStreamInfo.NumChannels();
+    spec.iBitDepth = bitDepth;
+    spec.iInputRate = decodedStreamInfo.SampleRate();
+    spec.iOutputRate = outputRate;
 
-    iDitch = true;
-    iProfileIndex = -1;
+    pcmProcessor.SetDuplicateChannel(iDuplicateChannel);
+    pcmProcessor.UpdateFormatSpec(spec);
+
+    const OutputFormat outputFormat = iProfile->GetFormat(bitDepth);
+    const TUint outputChannels =
+        (iDuplicateChannel && spec.iNumChannels == 1) ? 2 : spec.iNumChannels;
+    iSampleBytes = outputChannels * outputFormat.second;
+    iDitch = false;
 }
-TBool DriverAlsa::Pimpl::TryProfile(Profile& aProfile,
-                                    TUint aBitDepth,
-                                    TUint aNumChannels,
-                                    TUint aSampleRate,
-                                    TUint aBufferUs)
-{
-    auto outputFormat = aProfile.GetFormat(aBitDepth);
 
-    if (iDuplicateChannel) {
-        aNumChannels *= 2;
+TBool DriverAlsaPimpl::TryProfile(Profile& aProfile,
+                                  TUint aBitDepth,
+                                  TUint aNumChannels,
+                                  TUint aSampleRate,
+                                  TUint aBufferUs)
+{
+    if (aBitDepth != 32 && aBitDepth != 24 &&
+        aBitDepth != 16 && aBitDepth != 8) {
+        return false;
     }
+
+    if (iHandle == nullptr) {
+        return false;
+    }
+
+    auto outputFormat = aProfile.GetFormat(aBitDepth);
 
     snd_pcm_hw_params_t* hwParams;
     snd_pcm_sw_params_t* swParams;
     snd_pcm_hw_params_alloca(&hwParams);
     snd_pcm_sw_params_alloca(&swParams);
+
+    // Only call snd_pcm_hw_free if the device has already been configured.
+    // Calling it in SND_PCM_STATE_OPEN returns -EBADFD and causes setup to fail.
+    const snd_pcm_state_t state = snd_pcm_state(iHandle);
+    if (state != SND_PCM_STATE_OPEN) {
+        snd_pcm_hw_free(iHandle);
+    }
 
     int err = snd_pcm_hw_params_any(iHandle, hwParams);
     if (err < 0) return false;
@@ -973,9 +512,16 @@ TBool DriverAlsa::Pimpl::TryProfile(Profile& aProfile,
                                        outputFormat.first);
     if (err < 0) return false;
 
-    err = snd_pcm_hw_params_set_channels(iHandle, hwParams,
-                                         aNumChannels);
-    if (err < 0) return false;
+    const TUint outputChannels =
+        (iDuplicateChannel && aNumChannels == 1) ? 2 : aNumChannels;
+
+    err = snd_pcm_hw_params_set_channels(
+        iHandle,
+        hwParams,
+        outputChannels);
+    if (err < 0) {
+        return false;
+    }
 
     unsigned int rate = aSampleRate;
     err = snd_pcm_hw_params_set_rate_near(iHandle, hwParams, &rate, nullptr);
@@ -988,8 +534,6 @@ TBool DriverAlsa::Pimpl::TryProfile(Profile& aProfile,
                                                  nullptr);
     if (err < 0) return false;
 
-    // Réglage plus adapté SPI / embarqué :
-    // plusieurs petites périodes dans un buffer assez confortable.
     unsigned int periodTime = bufferTime / 8;
     if (periodTime < 10000) {
         periodTime = 10000; // 10 ms minimum
@@ -1035,24 +579,23 @@ TBool DriverAlsa::Pimpl::TryProfile(Profile& aProfile,
     if (err < 0) return false;
 
     Log::Print("DriverAlsa: configured ALSA: rate=%u channels=%u "
-               "format=%d buffer=%lu frames/%u us "
-               "period=%lu frames/%u us "
-               "startThreshold=%lu availMin=%lu\n",
-               rate,
-               aNumChannels,
-               outputFormat.first,
-               bufferSize,
-               bufferTime,
-               periodSize,
-               periodTime,
-               startThreshold,
-               availMin);
+           "format=%d buffer=%lu frames period=%lu frames\n",
+           rate,
+           outputChannels,
+           outputFormat.first,
+           bufferSize,
+           periodSize);
 
     return true;
 }
-TUint DriverAlsa::Pimpl::DriverDelayJiffies(TUint aSampleRate)
+
+TUint DriverAlsaPimpl::DriverDelayJiffies(TUint aSampleRate)
 {
-    if (!aSampleRate || iProfileIndex == -1) {
+    const TUint rate = iCurrentOutputRate.load() != 0
+        ? iCurrentOutputRate.load()
+        : aSampleRate;
+
+    if (iHandle == nullptr || !aSampleRate) {
         return 0;
     }
 
@@ -1060,61 +603,71 @@ TUint DriverAlsa::Pimpl::DriverDelayJiffies(TUint aSampleRate)
     int ret = snd_pcm_delay(iHandle, &delayFrames);
 
     if (ret < 0) {
-        ret = snd_pcm_recover(iHandle, ret, 1);
-        if (ret < 0) {
-            OhLog::PrintError("DriverAlsa: snd_pcm_delay() error: %s\n",
-                              snd_strerror(ret));
-            return 0;
-        }
-
-        ret = snd_pcm_delay(iHandle, &delayFrames);
-        if (ret < 0) {
-            return 0;
-        }
+        // Do not call snd_pcm_recover here: DriverDelayJiffies is called
+        // from the pipeline animator thread and can race with AudioThread writes.
+        return 0;
     }
 
     if (delayFrames < 0) {
         delayFrames = 0;
     }
 
-    return (TUint)delayFrames * Jiffies::PerSample(aSampleRate);
+    return (TUint)delayFrames * Jiffies::PerSample(rate);
 }
 
-// DriverAlsa
+void DriverAlsaPimpl::ProcessMode()
+{
+    OhLog::Print(
+        "DriverAlsa: MsgMode intercepted. Purging pipeline tracking state.\n");
 
-const TUint DriverAlsa::kSupportedMsgTypes = PipelineElement::MsgType::eMode
-| PipelineElement::MsgType::eDrain
-| PipelineElement::MsgType::eHalt
-| PipelineElement::MsgType::eDecodedStream
-| PipelineElement::MsgType::ePlayable
-| PipelineElement::MsgType::eQuit;
+    if (iProfile != nullptr) {
+        iProfile->GetPcmProcessor().Flush();
+    }
 
-DriverAlsa::DriverAlsa(IPipeline& aPipeline, TUint aBufferUs)
-    : PipelineElement(kSupportedMsgTypes)
-    , iPimpl(new Pimpl("default", aBufferUs))
+    iSampleBytes = 0;
+    iDitch = true;
+    iBytesSent = 0;
+}
+
+DriverAlsa::DriverAlsa(IPipeline& aPipeline, const Brx& aAlsaDevice, TUint aBufferUs, TUint aOutputSampleRate)
+: PipelineDriverBase(aPipeline, std::make_unique<DriverAlsaPimpl>(aAlsaDevice, aBufferUs, aOutputSampleRate))
+{}
+
+DriverAlsa::DriverAlsa(IPipeline& aPipeline, TUint aBufferUs, TUint aOutputSampleRate)
+: DriverAlsa(aPipeline, Brn("default"), aBufferUs, aOutputSampleRate)
+{}
+
+PipelineDriverBase::PipelineDriverBase(
+    IPipeline& aPipeline,
+    std::unique_ptr<IDriverBackend> aBackend)
+    : PipelineElement(GetSupportedElements())
     , iPipeline(aPipeline)
-    , iMutex("alsa")
+    , iMutex("PipelineDriverBase")
     , iQuit(false)
+    , iBackend(std::move(aBackend))
+    , iThread(nullptr)
 {
     iPipeline.SetAnimator(*this);
-
-    iThread = new ThreadFunctor("PipelineAnimator",
-                                MakeFunctor(*this, &DriverAlsa::AudioThread),
-                                kPrioritySystemHighest);
+    iThread = std::make_unique<ThreadFunctor>(
+    "PipelineAnimator",
+    MakeFunctor(*this, &PipelineDriverBase::AudioThread),
+    kPrioritySystemHighest);
     iThread->Start();
 }
 
-DriverAlsa::~DriverAlsa()
+PipelineDriverBase::~PipelineDriverBase()
 {
-    delete iThread;
-    delete iPimpl;
+    iThread.reset();
+    iBackend.reset();
 }
-void DriverAlsa::PipelineAnimatorGetMaxSampleRates(TUint& aPcm, TUint& aDsd) const
+
+void PipelineDriverBase::PipelineAnimatorGetMaxSampleRates(TUint& aPcm, TUint& aDsd) const
 {
     aPcm = 192000;
     aDsd = 5644800;
 }
-void DriverAlsa::AudioThread()
+
+void PipelineDriverBase::AudioThread()
 {
     try
     {
@@ -1135,12 +688,12 @@ void DriverAlsa::AudioThread()
     catch (ThreadKill&) {}
 }
 
-TUint DriverAlsa::PipelineAnimatorBufferJiffies() const
+TUint PipelineDriverBase::PipelineAnimatorBufferJiffies() const
 {
 	return 0;
 }
 
-TUint DriverAlsa::PipelineAnimatorDelayJiffies(AudioFormat aFormat,
+TUint PipelineDriverBase::PipelineAnimatorDelayJiffies(AudioFormat aFormat,
 											   TUint aSampleRate,
                                                TUint /*aBitDepth*/,
                                                TUint /*aNumChannels*/) const
@@ -1148,55 +701,63 @@ TUint DriverAlsa::PipelineAnimatorDelayJiffies(AudioFormat aFormat,
 	if (aFormat == AudioFormat::Dsd) {
 		THROW(FormatUnsupported);
 	}
-    return iPimpl->DriverDelayJiffies(aSampleRate);
+    return iBackend->DriverDelayJiffies(aSampleRate);
 }
 
-void DriverAlsa::PipelineAnimatorDsdBlockConfiguration(TUint& aSampleBlockWords, TUint& aPadBytesPerChunk) const
+void PipelineDriverBase::PipelineAnimatorDsdBlockConfiguration(TUint& aSampleBlockWords, TUint& aPadBytesPerChunk) const
 {
+    (void)aSampleBlockWords;
+    (void)aPadBytesPerChunk;
 }
 
-TUint DriverAlsa::PipelineAnimatorMaxBitDepth() const
+TUint PipelineDriverBase::PipelineAnimatorMaxBitDepth() const
 {
     return 0;
 }
 
-Msg* DriverAlsa::ProcessMsg(MsgHalt* aMsg)
+Msg* PipelineDriverBase::ProcessMsg(MsgHalt* aMsg)
 {
     aMsg->ReportHalted();
 
     return aMsg;
 }
 
-Msg* DriverAlsa::ProcessMsg(MsgDecodedStream* aMsg)
+Msg* PipelineDriverBase::ProcessMsg(MsgDecodedStream* aMsg)
 {
-    iPimpl->ProcessDecodedStream(aMsg);
+    iBackend->ProcessDecodedStream(aMsg);
+
     return aMsg;
 }
 
-Msg* DriverAlsa::ProcessMsg(MsgPlayable* aMsg)
+Msg* PipelineDriverBase::ProcessMsg(MsgPlayable* aMsg)
 {
-    iPimpl->ProcessPlayable(aMsg);
+    iBackend->ProcessPlayable(aMsg);
+
     return aMsg;
 }
 
-Msg* DriverAlsa::ProcessMsg(MsgQuit* aMsg)
+Msg* PipelineDriverBase::ProcessMsg(MsgQuit* aMsg)
 {
     AutoMutex am(iMutex);
     iQuit = true;
     return aMsg;
 }
 
-Msg* DriverAlsa::ProcessMsg(MsgMode* aMsg)
+Msg* PipelineDriverBase::ProcessMsg(MsgMode* aMsg)
 {
-    // TODO
+    const Brx& modeName = aMsg->Mode();
+    Brhz modeNameCStr(modeName); 
+    OhLog::Print("DriverAlsa: MsgMode intercepted. %s \n", modeNameCStr.CString());
+
+    iBackend->ProcessMode();
+
     return aMsg;
 }
 
-Msg* DriverAlsa::ProcessMsg(MsgDrain* aMsg)
+Msg* PipelineDriverBase::ProcessMsg(MsgDrain* aMsg)
 {
     // Ensure the ALSA audio buffer is emptied.
-    iPimpl->ProcessDrain();
-
+    iBackend->ProcessDrain();
     aMsg->ReportDrained();
 
     return aMsg;
