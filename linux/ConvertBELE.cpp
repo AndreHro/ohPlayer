@@ -375,7 +375,6 @@ size_t OpenHome::Media::ConvertInterleavedToS32LE_With24Simd(
         }
     }
 
-    TUint8* outPtr = dst;
     if (hostIsLittle && !(duplicateMono && channels == 1)) {
         std::memcpy(
             dst,

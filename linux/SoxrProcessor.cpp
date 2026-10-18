@@ -1,5 +1,6 @@
 #include "SoxrProcessor.h"
 #include "IDataSink.h"
+#include "ConvertBELE.h"
 #include <OpenHome/Private/Printer.h>
 
 #include <soxr.h>
@@ -24,6 +25,7 @@ public:
     {
         if (iInstance) {
             soxr_delete(iInstance);
+            iInstance = nullptr;
         }
     }
 
@@ -32,6 +34,7 @@ public:
 
     const AudioSpec& GetSpec() const { return iSpec; }
     soxr_datatype_t GetInputType() const { return iInputType; }
+    bool IsFlushed() const { return iFlushed; }
 
 private:
 
@@ -43,6 +46,7 @@ private:
     AudioSpec       iSpec;
     soxr_datatype_t iInputType;
     TBool           iDuplicateMono;
+    bool            iFlushed;
     std::vector<TByte> iStereoBuffer;
     std::vector<TByte> iOutputBuffer;
 };
@@ -54,6 +58,7 @@ SoxrPcmProcessor::SoxrPcmProcPimpl::SoxrPcmProcPimpl(IDataSink& aDataSink, const
 , iSpec(aSpec)
 , iInputType(aInputType)
 , iDuplicateMono(aSpec.iNumChannels == 1 && aDuplicateChannel)
+, iFlushed(false)
 , iStereoBuffer()
 , iOutputBuffer()
 {
@@ -85,6 +90,10 @@ SoxrPcmProcessor::SoxrPcmProcPimpl::SoxrPcmProcPimpl(IDataSink& aDataSink, const
 void SoxrPcmProcessor::SoxrPcmProcPimpl::ProcessFragmentWithSoxr(
     const Brx& aData, TUint aNumChannels, TUint aSubsampleBytes)
 {
+    if (iFlushed || !iInstance) {
+        return;
+    }
+
     if (aData.Bytes() == 0 || aData.Ptr() == nullptr) {
         return; 
     }
@@ -111,7 +120,7 @@ void SoxrPcmProcessor::SoxrPcmProcPimpl::ProcessFragmentWithSoxr(
         iSpec.iNumChannels * kOutputSampleBytes;
     iOutputBuffer.resize(maxOutputFrames * bytesPerResamplerFrame);
     
-    TUint outputFramesProcessed = 0;
+    size_t outputFramesProcessed = 0;
 
     iError = soxr_process(iInstance,
                           aData.Ptr(),
@@ -140,9 +149,11 @@ void SoxrPcmProcessor::SoxrPcmProcPimpl::ProcessFragmentWithSoxr(
 
 void SoxrPcmProcessor::SoxrPcmProcPimpl::FlushResamplerCache()
 {
-    if (!iInstance) {
+    if (!iInstance || iFlushed) {
         return;
     }
+
+    iFlushed = true;
 
     constexpr TUint flushFrames = 2048;
     const TUint resamplerChannels = iSpec.iNumChannels;
@@ -150,7 +161,7 @@ void SoxrPcmProcessor::SoxrPcmProcPimpl::FlushResamplerCache()
     iOutputBuffer.resize(flushFrames * bytesPerResamplerFrame);
 
     for (;;) {
-        TUint outputFrames = 0;
+        size_t outputFrames = 0;
 
         iError = soxr_process(iInstance,
                               nullptr,
@@ -216,9 +227,11 @@ SoxrPcmProcessor::~SoxrPcmProcessor() {}
 
 void SoxrPcmProcessor::UpdateFormatSpec(const AudioSpec& aSpec)
 {
-    if (iCurrentSpec!=aSpec) {
+    if (iCurrentSpec != aSpec) {
         if (iImpl) {
-            iImpl->FlushResamplerCache();
+            if (!iImpl->IsFlushed()) {
+                iImpl->FlushResamplerCache();
+            }
             iImpl.reset();
         }
 
@@ -231,7 +244,9 @@ void SoxrPcmProcessor::SetDuplicateChannel(TBool aDuplicateChannel)
 {
     if (iDuplicateChannel != aDuplicateChannel) {
         if (iImpl) {
-            iImpl->FlushResamplerCache();
+            if (!iImpl->IsFlushed()) {
+                iImpl->FlushResamplerCache();
+            }
             iImpl.reset();
         }
 
@@ -246,197 +261,120 @@ void SoxrPcmProcessor::ProcessFragment(
     TUint aSubsampleBytes)
 {
     const TUint bytesPerFrame = aNumChannels * aSubsampleBytes;
-
-    if (bytesPerFrame == 0) {
+    if (bytesPerFrame == 0 || aData.Bytes() == 0) {
         return;
     }
 
     if (iBuffer->Bytes() != 0 &&
         (iPendingChannels != aNumChannels ||
-        iPendingSampleBytes != aSubsampleBytes)) {
+         iPendingSampleBytes != aSubsampleBytes)) {
         Clean();
     }
 
     iPendingChannels = aNumChannels;
     iPendingSampleBytes = aSubsampleBytes;
-    iBuffer->Append(aData);
 
-    const TUint completeBytes = 
-        (iBuffer->Bytes() / bytesPerFrame) * bytesPerFrame;
+    const TByte* dataPtr = aData.Ptr();
+    TUint bytesRemaining = aData.Bytes();
 
-    const TUint remainingBytes = iBuffer->Bytes() - completeBytes;
+    // If there are leftover bytes from a previous fragment, complete that frame first
+    if (iBuffer->Bytes() > 0) {
+        const TUint needed = bytesPerFrame - iBuffer->Bytes();
+        if (bytesRemaining < needed) {
+            iBuffer->Append(aData);
+            return;
+        }
 
-    if (completeBytes != 0) {
-        Brn completeData(iBuffer->Ptr(), completeBytes);
-        ProcessCompleteFragment(
-            completeData,
-            aNumChannels,
-            aSubsampleBytes);
-    }
+        Brn chunk(dataPtr, needed);
+        iBuffer->Append(chunk);
+        dataPtr += needed;
+        bytesRemaining -= needed;
 
-    if (remainingBytes == 0) {
+        Brn completeFrame(iBuffer->Ptr(), bytesPerFrame);
+        ProcessCompleteFragment(completeFrame, aNumChannels, aSubsampleBytes);
         Clean();
-        return;
     }
 
-    // Copy the incomplete trailing frame before changing iBuffer.
-    iRemainderBuffer.resize(remainingBytes);
+    // Process complete frames directly from input without extra buffering
+    const TUint completeBytes = (bytesRemaining / bytesPerFrame) * bytesPerFrame;
+    if (completeBytes > 0) {
+        Brn completeData(dataPtr, completeBytes);
+        ProcessCompleteFragment(completeData, aNumChannels, aSubsampleBytes);
+        dataPtr += completeBytes;
+        bytesRemaining -= completeBytes;
+    }
 
-    std::memcpy(iRemainderBuffer.data(),
-                iBuffer->Ptr() + completeBytes,
-                remainingBytes);
-
-    Clean();
-
-    Brn remainderData(iRemainderBuffer.data(), remainingBytes);
-    iBuffer->Append(remainderData);
-
-    iPendingChannels = aNumChannels;
-    iPendingSampleBytes = aSubsampleBytes;
+    // Save any trailing incomplete frame
+    if (bytesRemaining > 0) {
+        Brn trailingData(dataPtr, bytesRemaining);
+        iBuffer->Append(trailingData);
+        iPendingChannels = aNumChannels;
+        iPendingSampleBytes = aSubsampleBytes;
+    }
 }
 
 void SoxrPcmProcessor::ProcessCompleteFragment(const Brx& aData, TUint aNumChannels, TUint aSubsampleBytes)
 {
+    if (aSubsampleBytes < 1 || aSubsampleBytes > 4) {
+        return;
+    }
+    
     const TUint bytesPerFrame = aNumChannels * aSubsampleBytes;
     if (bytesPerFrame == 0 || aData.Bytes() < bytesPerFrame || aData.Ptr() == nullptr) {
         return;
     }
 
-    soxr_datatype_t inputType;
-    const Brx* dataToProcess = &aData;
-    Brn localThreadWrapper; // Fixed: Thread-safe local scope handling
-    
-    switch(aSubsampleBytes) {
-    case 1: {
-        // Safe 8-bit to 16-bit expansion mapping
-        inputType = SOXR_INT16_I;
-
-        const TUint numSamples = aData.Bytes();
-        iInputBuffer.resize(numSamples * sizeof(TInt16));
-
-        const TByte* src = aData.Ptr();
-        TByte* dest = iInputBuffer.data();
-
-        for (TUint i = 0; i < numSamples; ++i) {
-            const TInt16 sample =
-                static_cast<TInt16>(
-                    (static_cast<TInt32>(src[i]) - 128) << 8);
-
-            std::memcpy(dest + i * sizeof(TInt16), &sample, sizeof(sample));
-        }
-
-        localThreadWrapper.Set(iInputBuffer.data(), iInputBuffer.size());
-        dataToProcess = &localThreadWrapper;
-        break;
-    }
-    case 2: {
-        inputType = SOXR_INT16_I;
-
-        const TUint numSamples = aData.Bytes() / 2;
-        iInputBuffer.resize(numSamples * sizeof(TInt16));
-
-        const TByte* src = aData.Ptr();
-        TByte* dest = iInputBuffer.data();
-
-        for (TUint i = 0; i < numSamples; ++i) {
-            // Input is packed big-endian; soxr expects native-endian PCM.
-            const TInt16 sample = static_cast<TInt16>(
-                (static_cast<TUint16>(src[0]) << 8) |
-                static_cast<TUint16>(src[1]));
-
-            std::memcpy(dest + i * sizeof(TInt16), &sample, sizeof(sample));
-            src += 2;
-        }
-
-        localThreadWrapper.Set(iInputBuffer.data(), iInputBuffer.size());
-        dataToProcess = &localThreadWrapper;
-        break;
-    }
-
-    case 3: {
-        inputType = SOXR_INT32_I;
-
-        const TUint numSamples = aData.Bytes() / 3;
-        iInputBuffer.resize(numSamples * sizeof(TInt32));
-
-        const TByte* src = aData.Ptr();
-        TByte* dest = iInputBuffer.data();
-
-        for (TUint i = 0; i < numSamples; ++i) {
-            TUint32 value =
-                (static_cast<TUint32>(src[0]) << 16) |
-                (static_cast<TUint32>(src[1]) << 8) |
-                static_cast<TUint32>(src[2]);
-
-            if ((value & 0x00800000u) != 0) {
-                value |= 0xFF000000u;
-            }
-
-            // Preserve the existing 24-bit-to-32-bit left alignment.
-            value <<= 8;
-
-            std::memcpy(dest + i * sizeof(TInt32), &value, sizeof(value));
-            src += 3;
-        }
-
-        localThreadWrapper.Set(iInputBuffer.data(), iInputBuffer.size());
-        dataToProcess = &localThreadWrapper;
-        break;
-    }
-
-    case 4: {
-        inputType = SOXR_INT32_I;
-
-        const TUint numSamples = aData.Bytes() / 4;
-        iInputBuffer.resize(numSamples * sizeof(TInt32));
-
-        const TByte* src = aData.Ptr();
-        TByte* dest = iInputBuffer.data();
-
-        for (TUint i = 0; i < numSamples; ++i) {
-            const TUint32 value =
-                (static_cast<TUint32>(src[0]) << 24) |
-                (static_cast<TUint32>(src[1]) << 16) |
-                (static_cast<TUint32>(src[2]) << 8) |
-                static_cast<TUint32>(src[3]);
-
-            std::memcpy(dest + i * sizeof(TInt32), &value, sizeof(value));
-            src += 4;
-        }
-
-        localThreadWrapper.Set(iInputBuffer.data(), iInputBuffer.size());
-        dataToProcess = &localThreadWrapper;
-        break;
-    }
-    default:
+    const TUint inputFrames = aData.Bytes() / bytesPerFrame;
+    if (inputFrames == 0) {
         return;
     }
 
-    const TUint effectiveSampleBytes =
-        (aSubsampleBytes == 1) ? 2 :
-        (aSubsampleBytes == 3) ? 4 :
-        aSubsampleBytes;
+    const TUint totalSamples = inputFrames * aNumChannels;
+    const TUint s32Bytes = totalSamples * sizeof(TInt32);
+    iInputBuffer.resize(s32Bytes);
 
-    if (!iImpl || iCurrentSpec.iNumChannels != aNumChannels ||
-        iImpl->GetInputType() != inputType)
+    const size_t convertedFrames = OpenHome::Media::ConvertInterleavedToS32LE_With24Simd(
+        aData.Ptr(),
+        aData.Bytes(),
+        reinterpret_cast<TUint8*>(iInputBuffer.data()),
+        inputFrames,
+        aNumChannels,
+        aSubsampleBytes,
+        false /* sourceLittleEndian: OpenHome pipeline is Big-Endian */,
+        false /* duplicateMono: handled after resampling */,
+        iTmpOut);
+
+    if (convertedFrames == 0) {
+        return;
+    }
+
+    const TUint convertedBytes = convertedFrames * aNumChannels * sizeof(TInt32);
+    Brn convertedData(iInputBuffer.data(), convertedBytes);
+
+    if (!iImpl || iImpl->IsFlushed() ||
+        iCurrentSpec.iNumChannels != aNumChannels ||
+        iImpl->GetInputType() != SOXR_INT32_I)
     {
         if (iImpl) {
-            iImpl->FlushResamplerCache();
+            if (!iImpl->IsFlushed()) {
+                iImpl->FlushResamplerCache();
+            }
             iImpl.reset();
         }
         iCurrentSpec.iNumChannels = aNumChannels;
         iImpl = std::make_unique<SoxrPcmProcPimpl>(
-            *iSink, iCurrentSpec, inputType, iDuplicateChannel);
+            *iSink, iCurrentSpec, SOXR_INT32_I, iDuplicateChannel);
         if (!iImpl) {
             return;
         }
     }
 
     iImpl->ProcessFragmentWithSoxr(
-        *dataToProcess,
+        convertedData,
         aNumChannels,
-        effectiveSampleBytes);
+        sizeof(TInt32));
 }
+
 void SoxrPcmProcessor::EndBlock()
 {
     // Continuous audio pipeline: MsgPlayable invokes BeginBlock/ProcessFragment/EndBlock
@@ -446,7 +384,10 @@ void SoxrPcmProcessor::EndBlock()
 void SoxrPcmProcessor::Flush()
 {
     if (iImpl) {
-        iImpl->FlushResamplerCache();
+        if (!iImpl->IsFlushed()) {
+            iImpl->FlushResamplerCache();
+        }
+        iImpl.reset();
     }
 
     Clean();
@@ -465,23 +406,20 @@ void SoxrPcmProcessor::BeginBlock()
 void SoxrPcmProcessor::ProcessSilence(
     const Brx& aData, TUint aNumChannels, TUint aSubsampleBytes)
 {
-    TUint targetBytes = aData.Bytes();
-    if (targetBytes == 0) {
-        targetBytes = 128 * aNumChannels * aSubsampleBytes;
+    if (aData.Bytes() > 0) {
+        ProcessFragment(aData, aNumChannels, aSubsampleBytes);
+        return;
     }
 
     const TUint bytesPerFrame = aNumChannels * aSubsampleBytes;
     if (bytesPerFrame == 0) {
         return;
     }
-    
-    const TUint alignedBytes = (targetBytes / bytesPerFrame) * bytesPerFrame;
-    if (alignedBytes == 0) {
-        return;
-    }
 
-    std::vector<TByte> silenceBuffer(alignedBytes, 0);
-    Brn silenceData(silenceBuffer.data(), alignedBytes);
+    const TUint alignedBytes = 128 * bytesPerFrame;
+    iSilenceBuffer.resize(alignedBytes);
+    std::fill(iSilenceBuffer.begin(), iSilenceBuffer.end(), 0);
+    Brn silenceData(iSilenceBuffer.data(), alignedBytes);
 
-    ProcessCompleteFragment(silenceData, aNumChannels, aSubsampleBytes);
+    ProcessFragment(silenceData, aNumChannels, aSubsampleBytes);
 }
