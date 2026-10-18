@@ -1,0 +1,15 @@
+devices:
+  samplerate: 352800
+  chunksize: 2048
+  enable_resampling: true
+  resampler_type: AsyncSinc
+
+  capture:
+    type: Stdin
+    channels: 2
+    format: S32LE
+    
+  playback:
+    type: Alsa
+    device: "hw:CARD=Spring3,DEV=0"
+    format: S32LE

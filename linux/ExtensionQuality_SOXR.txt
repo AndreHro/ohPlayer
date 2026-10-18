@@ -1,0 +1,205 @@
+#include <soxr.h>
+
+enum ResampleQuality
+{
+    eHQSource,
+    eLQSource
+};
+
+
+Msg* DriverAlsa::ProcessMsg(MsgMode* aMsg)
+{
+    const Brx& modeName = aMsg->Mode();
+    ResampleQuality quality;
+    if (modeName == tvToken || modeName == opticalToken) {
+        Log::Print("DriverAlsa: TV Mode Detected. Engaging Low-Latency Profiles.\n");
+        quality = eLQSource;
+    } else {
+        Log::Print("DriverAlsa: Standard Music Mode Detected. Engaging High-Quality Filters.\n");
+        quality = eHQSource;
+    }
+
+    iPimpl->ProcessMode();
+
+    return aMsg;
+}
+
+void DriverAlsa::Pimpl::ProcessMode(ResampleQuality aQuality)
+{
+    if(aQuality==iQuality)
+    // Clear Soxr math boundaries without dropping hard memory allocations
+    const TInt profileIndex = iProfileIndex.load();
+    if (profileIndex != -1) {
+        iProfiles[profileIndex].GetPcmProcessor().Flush();
+    }
+
+    iQuality = aQuality
+
+    // Instantly purge active ALSA ring queues
+    if (iHandle) {
+        snd_pcm_drop(iHandle);
+        snd_pcm_prepare(iHandle);
+    }
+
+    iSampleBytes = 0;
+    iDitch = false;
+    iBytesSent = 0;
+    iProfileIndex.store(-1); // Force TryProfile() mapping on next packet block
+}
+
+
+// DYNAMIC SPECS: Choose between Lip-Sync matching and High-Fidelity Music
+soxr_quality_spec_t qSpec;
+TUint mode;
+switch (iQuality)
+case eLQSource:
+    mode=SOXR_LQ;  // SOXR_LQ (Low Quality) / SOXR_MQ (Medium Quality) use significantly 
+                   // smaller filter lengths, dropping processing group delay to ~1ms
+    break;
+case HQSource:
+    mode=SOXR_HQ; // Standard playback uses high-precision long phase filters for maximum audio fidelity
+    break; 
+case default:
+    break;
+qSpec = soxr_quality_spec(mode, 0); 
+
+iInstance = soxr_create(
+    iSpec.iInputRate,
+    iSpec.iOutputRate,
+    iSpec.iNumChannels,
+    &iError,
+    &ioSpec,
+    &qSpec,
+    nullptr);
+
+
+#include <soxr.h>
+#include <atomic>
+#include <cstring>
+
+// 1. Fixed Enum Syntax (replaces semicolon with commas)
+enum ResampleQuality
+{
+    eHQSource,
+    eLQSource
+};
+
+// Mock structures to allow code compilation
+struct Msg { /* ... */ };
+struct MsgMode { const char* Mode() { return "TV"; } };
+const char* tvToken = "TV";
+const char* opticalToken = "Optical";
+typedef int TInt;
+typedef unsigned int TUint;
+struct Log { static void Print(const char* fmt) {} };
+struct snd_pcm_t;
+void snd_pcm_drop(snd_pcm_t* h) {}
+void snd_pcm_prepare(snd_pcm_t* h) {}
+
+class DriverAlsa {
+public:
+    Msg* ProcessMsg(MsgMode* aMsg);
+private:
+    struct Pimpl {
+        void ProcessMode(ResampleQuality aQuality);
+        
+        // Mock sub-structures
+        struct Processor { void Flush() {} };
+        struct Profile { Processor& GetPcmProcessor() { return iProc; } Processor iProc; };
+        
+        // Member Variables
+        ResampleQuality iQuality;
+        std::atomic<TInt> iProfileIndex{-1};
+        Profile iProfiles[2];
+        snd_pcm_t* iHandle = nullptr;
+        TInt iSampleBytes = 0;
+        bool iDitch = false;
+        TInt iBytesSent = 0;
+        soxr_t iInstance = nullptr;
+        
+        // Mock Specs required by SoXr
+        struct Spec { double iInputRate = 44100; double iOutputRate = 48000; TUint iNumChannels = 2; } iSpec;
+        soxr_io_spec_t ioSpec = soxr_io_spec(SOXR_FLOAT32_I, SOXR_FLOAT32_I);
+        soxr_error_t iError;
+    };
+    Pimpl* iPimpl;
+};
+
+Msg* DriverAlsa::ProcessMsg(MsgMode* aMsg)
+{
+    const char* modeName = aMsg->Mode();
+    ResampleQuality quality;
+    
+    // String comparison fix (Assumed C-style string comparison)
+    if (std::strcmp(modeName, tvToken) == 0 || std::strcmp(modeName, opticalToken) == 0) {
+        Log::Print("DriverAlsa: TV Mode Detected. Engaging Low-Latency Profiles.\n");
+        quality = eLQSource;
+    } else {
+        Log::Print("DriverAlsa: Standard Music Mode Detected. Engaging High-Quality Filters.\n");
+        quality = eHQSource;
+    }
+
+    // 2. Fixed Function Call: Pass the quality argument into ProcessMode
+    iPimpl->ProcessMode(quality);
+
+    return aMsg;
+}
+
+void DriverAlsa::Pimpl::ProcessMode(ResampleQuality aQuality)
+{
+    // 3. Fixed If Statement: Added brackets to enclose code block
+    if (aQuality == iQuality) {
+        return; // Early return if mode did not change
+    }
+    
+    // Clear Soxr math boundaries without dropping hard memory allocations
+    const TInt profileIndex = iProfileIndex.load();
+    if (profileIndex != -1) {
+        iProfiles[profileIndex].GetPcmProcessor().Flush();
+    }
+
+    // 4. Fixed Missing Semicolon
+    iQuality = aQuality;
+
+    // Instantly purge active ALSA ring queues
+    if (iHandle) {
+        snd_pcm_drop(iHandle);
+        snd_pcm_prepare(iHandle);
+    }
+
+    iSampleBytes = 0;
+    iDitch = false;
+    iBytesSent = 0;
+    iProfileIndex.store(-1); // Force TryProfile() mapping on next packet block
+
+    // 5. Fixed Switch Statement Blocks (Moved code inside function scope)
+    soxr_quality_spec_t qSpec;
+    TUint mode = SOXR_HQ; // Set a safe default fallback value
+    
+    switch (iQuality) {
+    case eLQSource:
+        mode = SOXR_LQ;  // Drop filter sizes for lip-sync matching (~1ms delay)
+        break;
+    case eHQSource:      // 6. Fixed mismatched enum label name (added 'e')
+        mode = SOXR_HQ;  // High fidelity mode
+        break; 
+    default:             // 7. Fixed default keyword syntax order
+        break;
+    }
+    
+    qSpec = soxr_quality_spec(mode, 0); 
+
+    // Clean up old instance before re-creating to avoid memory leaks
+    if (iInstance) {
+        soxr_delete(iInstance);
+    }
+
+    iInstance = soxr_create(
+        iSpec.iInputRate,
+        iSpec.iOutputRate,
+        iSpec.iNumChannels,
+        &iError,
+        &ioSpec,
+        &qSpec,
+        nullptr);
+}

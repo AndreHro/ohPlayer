@@ -1,5 +1,5 @@
 #pragma once
-
+#if 0
 #include <glib.h>
 
 extern const gchar *g_appName;
@@ -10,3 +10,4 @@ extern const gchar *g_appName;
 #endif // USE_GTK
 void     updatesAvailable(gpointer data);
 
+#endif
