@@ -3,6 +3,7 @@
 #include "RaspdacMiniIF.h"
 #include "OhLinnAmpVolume.h"
 #include "LinnAmpConfig.h"
+#include "StoreWithOverriddenValue.h"
 #include "ConfigAppPlayerLinn.h"
 #include <OpenHome/Types.h>
 #include <OpenHome/Net/Private/DviStack.h>
@@ -257,17 +258,32 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
 
     // Read Linn Amp settings from the config store (web config)
     Bws<LinnAmpConfig::kMaxSerialPortBytes> serialPortBuf;
-    TBool useLinnAmp = false;
-    LinnAmpConfig::ReadFromStore(*iConfigRamStore, serialPortBuf, useLinnAmp);
-    
-    // Use Linn Amp volume control if requested and serial port is provided
-    if (useLinnAmp && serialPortBuf.Bytes() > 0) {
+    LinnAmpConfig::ReadSerialPortFromStore(*iConfigRamStore, serialPortBuf);
+
+    // Volume routing, matching official Linn DS behaviour:
+    //  - Volume.Enabled = Yes (default when unset): internal volume control,
+    //    using the ALSA mixer. If the sound card has no mixer the volume is
+    //    greyed out in control point apps (Volume.Enabled forced to No).
+    //  - Volume.Enabled = No with a serial port configured: volume is
+    //    delegated to an external Linn amplifier. If no amplifier responds,
+    //    the volume stays greyed out.
+    // While an amplifier is active, the MediaPlayer is given a store wrapper
+    // that reports Volume.Enabled as Yes (ohPipeline only creates the Volume
+    // provider when internal volume control is enabled). The real store keeps
+    // the user's No, so the web ui reflects the intent and the next start
+    // selects the amplifier branch again. No store value is ever forced.
+    const TBool volumeEnabled = LinnAmpConfig::ReadVolumeControlEnabledFromStore(*iConfigRamStore, true);
+    TBool linnAmpUsed = false;
+
+    if (!volumeEnabled && serialPortBuf.Bytes() > 0) {
+        // External Linn amplifier over RS232.
         std::string serialPortStr(reinterpret_cast<const char*>(serialPortBuf.Ptr()), serialPortBuf.Bytes());
         const TUint volumeLimit = LinnAmpConfig::ReadVolumeLimitFromStore(*iConfigRamStore, 100);
         iLinnAmpVolume = new OhLinnAmpVolume(serialPortStr, volumeLimit);
         if (iLinnAmpVolume->IsVolumeSupported()) {
-            // Set the ALSA output to full scale: attenuation is handled by the Linn amp
-            iVolumeLogger.SetVolumeFixed(100 * 1024);
+            // Set the ALSA output level: attenuation is handled by the Linn amp
+            const TUint alsaVolume = LinnAmpConfig::ReadAlsaVolumeFromStore(*iConfigRamStore, 100);
+            iVolumeLogger.SetVolumeFixed(alsaVolume * 1024);
             volumeInit.SetVolume(*iLinnAmpVolume);
             volumeInit.SetBalance(*iLinnAmpVolume);
             volumeInit.SetFade(*iLinnAmpVolume);
@@ -276,19 +292,42 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
             const TInt treble = LinnAmpConfig::ReadToneFromStore(*iConfigRamStore, LinnAmpConfig::kKeyTreble, 0);
             iLinnAmpVolume->SetBass(bass);
             iLinnAmpVolume->SetTreble(treble);
+            linnAmpUsed = true;
             Log::Print("Using Linn Amp volume control on %s\n", serialPortStr.c_str());
         } else {
             delete iLinnAmpVolume;
             iLinnAmpVolume = nullptr;
+            // No amplifier detected: grey out the volume in control points.
+            // Volume.Enabled already reads No, so the greyed-out state is
+            // announced and persists to the next start.
+            Log::Print("Linn Amp volume control failed - volume disabled\n");
+            volumeInit.SetVolume(iVolumeSinkLogger);
+            volumeInit.SetBalance(iVolumeSinkLogger);
+            volumeInit.SetFade(iVolumeSinkLogger);
+        }
+    } else if (volumeEnabled) {
+        // Internal volume control: use the ALSA mixer.
+        if (iVolumeLogger.IsVolumeSupported()) {
             volumeInit.SetVolume(iVolumeLogger);
             volumeInit.SetBalance(iVolumeLogger);
             volumeInit.SetFade(iVolumeLogger);
-            Log::Print("Linn Amp volume control failed, falling back to ALSA\n");
+        } else {
+            // No mixer on the sound card: no volume control at all.
+            // Grey out the volume in control points by disabling Volume.Enabled
+            // before the MediaPlayer is created (ohPipeline only announces the
+            // Volume attribute when internal volume control is enabled).
+            Log::Print("Internal volume control enabled but sound card has no mixer - volume disabled\n");
+            LinnAmpConfig::WriteVolumeControlEnabled(*iConfigRamStore, false);
+            volumeInit.SetVolume(iVolumeSinkLogger);
+            volumeInit.SetBalance(iVolumeSinkLogger);
+            volumeInit.SetFade(iVolumeSinkLogger);
         }
     } else {
-        volumeInit.SetVolume(iVolumeLogger);
-        volumeInit.SetBalance(iVolumeLogger);
-        volumeInit.SetFade(iVolumeLogger);
+        // Volume control disabled and no external amplifier: greyed out.
+        Log::Print("Internal volume control disabled - volume greyed out\n");
+        volumeInit.SetVolume(iVolumeSinkLogger);
+        volumeInit.SetBalance(iVolumeSinkLogger);
+        volumeInit.SetFade(iVolumeSinkLogger);
     }
 
     // Create MediaPlayer.
@@ -305,8 +344,22 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
     auto mpInit = MediaPlayerInitParams::New(Brn(aRoom), Brn(aProductName), kFriendlyNamePrefix);
     mpInit->EnableConfigApp();
     mpInit->EnablePins(kMaxPinsDevice);
+    // When a Linn amp handles volume, report Volume.Enabled as Yes to the
+    // MediaPlayer only (see StoreWithOverriddenValue); the real store keeps
+    // the user's setting so the web ui and the next start are unaffected.
+    static const TByte kVolumeEnabledYes[] = { 0, 0, 0, 1 }; // big-endian eStringIdYes
+    if (linnAmpUsed) {
+        iMediaPlayerStore = std::make_unique<StoreWithOverriddenValue>(
+            *iConfigRamStore, Brn("Volume.Enabled"), Brn(kVolumeEnabledYes, sizeof(kVolumeEnabledYes)));
+    }
+    else {
+        iMediaPlayerStore = nullptr;
+    }
+    IStoreReadWrite& mediaPlayerStore = (iMediaPlayerStore != nullptr)
+        ? static_cast<IStoreReadWrite&>(*iMediaPlayerStore)
+        : static_cast<IStoreReadWrite&>(*iConfigRamStore);
     iMediaPlayer = std::make_unique<MediaPlayer>(aDvStack, aCpStack, *iDevice, *iRamStore,
-                                   *iConfigRamStore, pipelineInit, *iAudioTime,
+                                   mediaPlayerStore, pipelineInit, *iAudioTime,
                                    volumeInit, volumeProfile,
                                    *iInfoLogger,
                                    aUdn, mpInit);
@@ -420,9 +473,12 @@ void TestMediaPlayer::Run()
     InitialiseSubsystems();
 
     // Debugging for ConfigManager.
+    // NOTE: do NOT call configManager.DumpToStore() here: it rewrites every
+    // in-memory ConfigVal back to the store, which would clobber the
+    // Volume.Enabled=No restoration done for Linn amp setups (see the volume
+    // routing in the constructor).
     IConfigManager& configManager = iMediaPlayer->ConfigManager();
     configManager.Print();
-    configManager.DumpToStore();
 
     iAppFramework->Start();
 
@@ -465,9 +521,12 @@ void TestMediaPlayer::RunWithSemaphore()
     InitialiseSubsystems();
 
     // Debugging for ConfigManager.
+    // NOTE: do NOT call configManager.DumpToStore() here: it rewrites every
+    // in-memory ConfigVal back to the store, which would clobber the
+    // Volume.Enabled=No restoration done for Linn amp setups (see the volume
+    // routing in the constructor).
     IConfigManager& configManager = iMediaPlayer->ConfigManager();
     configManager.Print();
-    configManager.DumpToStore();
 
     iAppFramework->Start();
     EnableDevices();
@@ -645,7 +704,8 @@ IWebApp* TestMediaPlayer::CreateConfigApp(const std::vector<const Brx*>& aSource
                                    Brn("Softplayer"), aResourceDir,
                                    aMinWebUiResourceThreads, aMaxWebUiTabs, aMaxSendQueueSize,
                                    aMsgBufCount, aMsgBufBytes, iRebootHandler,
-                                   linnAmpModel, linnAmpSerial);
+                                   linnAmpModel, linnAmpSerial,
+                                   iLinnAmpVolume != nullptr);
 }
 
 void TestMediaPlayer::InitialiseLogger()
@@ -820,7 +880,22 @@ OpenHome::Net::Library* TestMediaPlayerInit::CreateLibrary(
 )
 {
     InitialisationParams* initParams = InitialisationParams::Create();
-    initParams->SetDvEnableBonjour(aRoom, true);
+    // The mDNS host name must be unique per machine. It used to be the room
+    // name (identical on every player unless -r was passed), causing
+    // mStatus_NameConflict (-65548) crashes when several players run on the
+    // same network. Derive it from the Linux host name (unique per machine)
+    // with a distinct suffix so it also cannot clash with the system mDNS
+    // daemon (avahi/mdnsd) announcing <hostname>.local.
+    Bws<128> mdnsHost;
+    mdnsHost.Append("ohp-");
+    char linuxHostName[64] = {0};
+    if (gethostname(linuxHostName, sizeof(linuxHostName) - 1) == 0 && linuxHostName[0] != '\0') {
+        mdnsHost.Append(Brn(linuxHostName));
+    }
+    else {
+        mdnsHost.Append(Brn(aRoom));
+    }
+    initParams->SetDvEnableBonjour(mdnsHost.PtrZ(), true);
     if (aLoopback == true) {
         initParams->SetUseLoopbackNetworkAdapter();
     }
