@@ -49,6 +49,9 @@ ViewModel = function(){
             containerId: "Display.Tabs.About.DetailedInfo",
             fields: [
                 { key:"About.SwVersion", title:"Software Version" },
+                { key:"About.OhNetVersion", title:"ohNet Version" },
+                { key:"About.OhPipelineVersion", title:"ohPipeline Version" },
+                { key:"About.OhPlayerCommit", title:"ohPlayer Commit" },
                 { key:"About.ModelVariant", title:"Software Variant" },
                 { key:"About.SwReleaseNotesUrl", type:"link", title:"Software Update Available", linktext:"<% if ('About.SwUpdate' in fields)  { %> <%- fields['About.SwUpdate'].value %> <% } %>", linktitle:"Release Notes" },
                 { key:"About.IpAddress", title:"IP Address" },
@@ -239,10 +242,10 @@ ViewModel = function(){
         {
             containerId:"Display.Tabs.RS232.BasicInfo",
             fields : [
-                { key:"LinnAmp.VolumeControl", helptext:"Helptext.LinnAmp.VolumeControl", title:"Volume Control", type:"choice" },
                 { key:"LinnAmp.SerialPort", helptext:"Helptext.LinnAmp.SerialPort", title:"Serial Port", type:"string" },
                 { key:"LinnAmp.Bass", helptext:"Helptext.LinnAmp.Bass", title:"Bass", type:"numeric" },
                 { key:"LinnAmp.Treble", helptext:"Helptext.LinnAmp.Treble", title:"Treble", type:"numeric" },
+                { key:"LinnAmp.AlsaVolume", helptext:"Helptext.LinnAmp.AlsaVolume", title:"ALSA Volume", type:"numeric" },
                 { key:"LinnAmp.Model", helptext:"Helptext.LinnAmp.Model", title:"Detected Amplifier" },
                 { key:"LinnAmp.Serial", helptext:"Helptext.LinnAmp.Serial", title:"Amplifier Serial" },
             ]
@@ -604,11 +607,8 @@ ViewModel = function(){
         "Helptext.Display.LedOffInSleep" : {
               description : "Select <span class='HelpTextOption'><%- field.meta.options[0].value %></span> to turn the power indicator LED(s) off when in sleep mode. Select <span class='HelpTextOption'><%- field.meta.options[1].value %></span> to dim the LED when in sleep mode."
         },
-        "Helptext.LinnAmp.VolumeControl" : {
-            description : "Select whether volume is controlled by the ALSA driver or by an external Linn amplifier connected over RS232. Changing this requires a reboot."
-        },
         "Helptext.LinnAmp.SerialPort" : {
-            description : "Serial port the Linn amplifier is connected to (e.g. /dev/ttyUSB0). Changing this requires a reboot."
+            description : "Serial port the Linn amplifier is connected to (e.g. /dev/ttyUSB0). The amplifier is only used when Internal Volume Control is set to No. Changing this requires a reboot."
         },
         "Helptext.LinnAmp.Model" : {
             description : "Model of the detected Linn amplifier."
@@ -618,6 +618,9 @@ ViewModel = function(){
         },
         "Helptext.LinnAmp.Treble" : {
             description : "Treble adjustment of the Linn amplifier, from -7 to +7. Changing this requires a reboot."
+        },
+        "Helptext.LinnAmp.AlsaVolume" : {
+            description : "ALSA output level (0-100) applied when the Linn amplifier controls the volume (Internal Volume Control set to No). Use this to match the loudness of a room driven by the Linn amplifier with a room driven by the ALSA mixer. Changing this requires a reboot."
         },
         "Helptext.LinnAmp.Serial" : {
             description : "Serial number of the detected Linn amplifier."
