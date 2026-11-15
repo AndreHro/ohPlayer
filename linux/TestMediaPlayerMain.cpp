@@ -1,4 +1,4 @@
-#include "OpenHomePlayer.h"
+//#include "OpenHomePlayer.h"
 #include "TestMediaPlayer.h"
 #include <OpenHome/Types.h>
 #include <OpenHome/Media/Tests/Cdecl.h>
@@ -90,7 +90,8 @@ void TestMediaPlayerThread::RunInThread()
     // Create TestMediaPlayer.
     tmp = new TestMediaPlayer(*dvStack, *cpStack, udn, iOptions.Room().CString(), iOptions.Name().CString(),
         iOptions.TuneIn().Value(), iOptions.Tidal().Value(), iOptions.Qobuz().Value(),
-        iOptions.UserAgent().Value(), iOptions.StoreFile().CString(), iOptions.OptionOdp().Value(), iOptions.OptionWebUi().Value());
+        iOptions.UserAgent().Value(), iOptions.StoreFile().CString(), iOptions.CamillaConfigDir().Value(),
+        iOptions.OptionOdp().Value(), iOptions.OptionWebUi().Value());
     Log::Print("%s:%d\n", __FILE__, __LINE__);
 #if 0
     // Add the audio driver to the pipeline.
@@ -131,15 +132,8 @@ void TestMediaPlayerThread::RunInThread()
 #include<signal.h>
 #include<unistd.h>
 void CDECL sig_handler(int signo);
-const gchar        *g_appName   = "OpenHomePlayer";
 int CDECL main(int aArgc, char* aArgv[])
 {
-#ifdef _WIN32
-    char* noErrDlgs = getenv("NO_ERROR_DIALOGS");
-    if (noErrDlgs != nullptr && strcmp(noErrDlgs, "1") == 0) {
-        _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
-    }
-#endif // _WIN32
     //if (signal(SIGINT, sig_handler) == SIG_ERR) {}
     // Parse options.
     TestMediaPlayerOptions options;

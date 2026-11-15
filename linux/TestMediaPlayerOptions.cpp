@@ -1,4 +1,4 @@
-#include <OpenHome/Av/Tests/TestMediaPlayer.h>
+#include "TestMediaPlayer.h"
 #include <OpenHome/Private/OptionParser.h>
 #include <OpenHome/Types.h>
 #include <OpenHome/Buffer.h>
@@ -20,6 +20,7 @@ TestMediaPlayerOptions::TestMediaPlayerOptions()
     , iOptionUserAgent("", "--useragent", Brn(""), "User Agent (for HTTP requests)")
     , iOptionClockPull("", "--clockpull", "Enable clock pulling")
     , iOptionStoreFile("-s", "--storefile", Brn(""), "File for reading/writing persistent store")
+    , iOptionCamillaConfigDir("", "--camilla-config", Brn(""), "Directory containing CamillaDSP config_<samplerate>hz.yaml files")
     , iOptionOdp("", "--odp", 0, "Port for ODP server")
     , iOptionWebUi("", "--webui", 0, "Port for Web UI server")
     , iOptionShell("", "--shell", 0, "Port for shell")
@@ -36,6 +37,7 @@ TestMediaPlayerOptions::TestMediaPlayerOptions()
     iParser.AddOption(&iOptionUserAgent);
     iParser.AddOption(&iOptionClockPull);
     iParser.AddOption(&iOptionStoreFile);
+    iParser.AddOption(&iOptionCamillaConfigDir);
     iParser.AddOption(&iOptionOdp);
     iParser.AddOption(&iOptionWebUi);
     iParser.AddOption(&iOptionShell);
@@ -109,6 +111,11 @@ const OptionBool& TestMediaPlayerOptions::ClockPull() const
 const OptionString& TestMediaPlayerOptions::StoreFile() const
 {
     return iOptionStoreFile;
+}
+
+const OptionString& TestMediaPlayerOptions::CamillaConfigDir() const
+{
+    return iOptionCamillaConfigDir;
 }
 
 const OptionUint& TestMediaPlayerOptions::OptionOdp() const

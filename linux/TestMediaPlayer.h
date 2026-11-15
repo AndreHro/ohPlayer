@@ -33,6 +33,10 @@
 #include <OpenHome/FsFlushPeriodic.h>
 #include "DriverAlsa.h"
 
+#ifdef CAPTURE_ALSA
+#include "capture/SourceAlsaCapture.h"
+#endif
+
 #include <memory>
 
 namespace OpenHome {
@@ -137,10 +141,11 @@ private:
     static const TUint kDsdSampleBlockWords = 6; // Specifies if the test player outputs DSD as 16xL, 16xR [32 bits = 1 word] or 4 x (24xL, 24xR) [192 bits = 6]
     static const TUint kDsdPadBytesPerChunk = 2;
     TUint              iExitRequested=0;
+
 public:
     TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack, const Brx& aUdn, const TChar* aRoom, const TChar* aProductName,
                     const Brx& aTuneInPartnerId, const Brx& aTidalId, const Brx& aQobuzIdSecret, const Brx& aUserAgent,
-                    const TChar* aStoreFile, TUint aOdpPort=0, TUint aWebUiPort=0,
+                    const TChar* aStoreFile, const Brx& aKFRConfigDir, TUint aOdpPort=0, TUint aWebUiPort=0,
                     TUint aMinWebUiResourceThreads=kMinWebUiResourceThreads, TUint aMaxWebUiTabs=kMaxWebUiTabs, TUint aUiSendQueueSize=kUiSendQueueSize, TUint aUiMsgBufCount=kUiMsgBufCount, TUint aUiMsgBufBytes=kUiMsgBufBytes);
     virtual ~TestMediaPlayer();
     void RequestExit();
@@ -223,7 +228,7 @@ private:
     TUint iUiMsgBufCount;
     TUint iUiMsgBufBytes;
 
-    std::unique_ptr<OpenHome::Media::DriverAlsa> iDriver;
+    std::unique_ptr<OpenHome::Media::PipelineDriverBase> iDriver;
     std::unique_ptr<Media::IPipelineObserver>    iRaspdacObserver;
     std::unique_ptr<IVolumeObserver>         iRaspdacVolumeObserver;
 };
@@ -246,6 +251,7 @@ public:
     const TestFramework::OptionString& UserAgent() const;
     const TestFramework::OptionBool& ClockPull() const;
     const TestFramework::OptionString& StoreFile() const;
+    const TestFramework::OptionString& CamillaConfigDir() const;
     const TestFramework::OptionUint& OptionOdp() const;
     const TestFramework::OptionUint& OptionWebUi() const;
     const TestFramework::OptionUint& Shell() const;
@@ -263,6 +269,7 @@ private:
     TestFramework::OptionString iOptionUserAgent;
     TestFramework::OptionBool iOptionClockPull;
     TestFramework::OptionString iOptionStoreFile;
+    TestFramework::OptionString iOptionCamillaConfigDir;
     TestFramework::OptionUint iOptionOdp;
     TestFramework::OptionUint iOptionWebUi;
     TestFramework::OptionUint iOptionShell;

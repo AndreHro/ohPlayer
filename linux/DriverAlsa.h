@@ -32,7 +32,7 @@ public:
     virtual void ProcessDecodedStream(MsgDecodedStream*) = 0;
     virtual void ProcessPlayable(MsgPlayable*) = 0;
     virtual void ProcessDrain() = 0;
-    virtual void ProcessMode() = 0;
+    virtual void ProcessMode(const Brx& aMode) = 0;
     virtual TUint DriverDelayJiffies(TUint aSampleRate) = 0;
 };
 
@@ -41,11 +41,12 @@ class PipelineDriverBase
     , public IPipelineAnimator
     , private INonCopyable
 {
+public:
+    virtual ~PipelineDriverBase();
+
 protected:
     PipelineDriverBase(IPipeline& aPipeline,
                        std::unique_ptr<IDriverBackend> aBackend);
-
-    ~PipelineDriverBase();
 
     void AudioThread();
 
@@ -88,7 +89,15 @@ protected:
 class DriverAlsa final : public PipelineDriverBase
 {
 public:
-    DriverAlsa(IPipeline& aPipeline, const Brx& aAlsaDevice, TUint aBufferUs, TUint aOutputSampleRate=0);
+    DriverAlsa(
+        IPipeline& aPipeline, 
+        const Brx& aAlsaDevice, 
+        TUint aBufferUs,
+        TUint aOutputSampleRate=0,
+        bool aDisableUpsample=false,
+        const Brx& aKfrIrConfigDir=Brn(""));
+    DriverAlsa(IPipeline& aPipeline, TUint aBufferUs, TUint aOutputSampleRate=0,
+               const Brx& aKfrIrConfigDir=Brn(""));
 };
 class CamillaDspDriver final : public PipelineDriverBase
 {
@@ -100,3 +109,4 @@ public:
 } // namespace OpenHome
 
 #endif // HEADER_PIPELINE_DRIVER_ALSA
+

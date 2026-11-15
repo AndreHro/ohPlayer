@@ -1,0 +1,130 @@
+#include "KfrDspInterface.h"
+#include <kfr/audio.hpp>
+#include <kfr/dsp.hpp>
+#include <string>
+#include <vector>
+
+static const std::string kLeftChannelFileName = "left_ir.wav";
+static const std::string kRightChannelFileName = "right_ir.wav";
+constexpr int numChannels=2;
+
+struct KfrDspContext {
+    // FIR Convolve filters per channel
+    kfr::convolve_filter<float> filters[numChannels]; 
+    
+    // Persistent internal cache buffer to avoid real-time heap reallocations
+    kfr::audio_data_interleaved kfr_buffer;
+    
+    // Dedicated block array for processing individual channel data linearly
+    kfr::univector<float> mono_processing_block;
+};
+
+
+KfrDspContext* kfr_dsp_create(const char* filter_path_or_json) {
+    if (!filter_path_or_json) return nullptr;
+
+    try {
+        KfrDspContext* ctx = new KfrDspContext();
+        std::string base_path(filter_path_or_json);
+        
+        if (!base_path.empty() && base_path.back() != '/') {
+            base_path += "/";
+        }
+
+        std::string channels[numChannels] = { 
+            base_path + kLeftChannelFileName,
+            base_path + kRightChannelFileName };
+
+        for (unsigned ch = 0; ch < numChannels; ++ch) {
+            // Read the REW-exported WAV file directly using KFR
+            auto file_result = kfr::decode_audio_file(channels[ch]);
+            if (!file_result) {
+                delete ctx;
+                return nullptr; // File missing or corrupt
+            }
+
+            kfr::audio_data_planar planar_ir(file_result.value());
+            kfr::univector_ref<float> ir_taps = planar_ir.channel(0);
+            ctx->filters[ch].set_taps(ir_taps);
+        }
+        
+        return ctx;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void kfr_dsp_destroy(KfrDspContext* ctx) {
+    if (ctx) {
+        delete ctx;
+    }
+}
+
+template <typename SampleType>
+void run_kfr_conversion_loop(KfrDspContext* ctx,
+    void* pcm_data,
+    size_t frame_count,
+    unsigned aNumChannels) {
+    size_t total_samples = frame_count * aNumChannels;
+    uint8_t* byte_ptr = reinterpret_cast<uint8_t*>(pcm_data);
+    float* float_buffer = ctx->kfr_buffer.data.data();
+
+    kfr::samples_load<SampleType>(
+        float_buffer,
+        byte_ptr,
+        total_samples,
+        kfr::audio_sample_type::unknown,
+        kfr::endianness::big
+    );
+
+    if (ctx->mono_processing_block.size() < frame_count) {
+        ctx->mono_processing_block.resize(frame_count);
+    }
+
+    for (unsigned ch = 0; ch < aNumChannels; ++ch) {
+        auto channel_signal = ctx->kfr_buffer.channel(ch);
+        
+        ctx->mono_processing_block = channel_signal;
+        ctx->filters[ch].apply(ctx->mono_processing_block);
+        channel_signal = ctx->mono_processing_block;
+    }
+
+    kfr::samples_store<SampleType>(
+        byte_ptr,
+        float_buffer,
+        total_samples,
+        kfr::audio_sample_type::unknown,
+        kfr::endianness::big
+    );
+}
+
+int kfr_dsp_process_interleaved(KfrDspContext* ctx,
+                                void* pcm_data,
+                                size_t frame_count,
+                                unsigned aNumChannels,
+                                KfrAudioType sample_type) {
+    if (!ctx || !pcm_data || frame_count == 0 || aNumChannels > 2) return -1;
+
+    if (ctx->kfr_buffer.size < frame_count || ctx->kfr_buffer.channels != aNumChannels) {
+        ctx->kfr_buffer.resize(aNumChannels, frame_count);
+    }
+
+    try {
+        switch (sample_type) {
+            case KFR_AUDIO_I16: 
+                run_kfr_conversion_loop<int16_t>(ctx, pcm_data, frame_count, aNumChannels); 
+                break;
+            case KFR_AUDIO_I24: 
+                run_kfr_conversion_loop<kfr::i24>(ctx, pcm_data, frame_count, aNumChannels); 
+                break;
+            case KFR_AUDIO_I32: 
+                run_kfr_conversion_loop<int32_t>(ctx, pcm_data, frame_count, aNumChannels); 
+                break;
+            default: 
+                return -2;
+        }
+        return 0; 
+    } catch (...) {
+        return -3; 
+    }
+}

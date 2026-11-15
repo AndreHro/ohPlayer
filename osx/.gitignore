@@ -1,9 +1,0 @@
-Include
-Libs
-build
-
-.DS_Store
-OpenHomePlayer.xcodeproj/project.xcworkspace/xcuserdata
-OpenHomePlayer.xcodeproj/xcuserdata
-OpenHomePlayer*.pkg
-

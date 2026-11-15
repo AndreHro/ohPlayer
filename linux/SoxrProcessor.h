@@ -72,9 +72,11 @@ private:
     AudioSpec    iCurrentSpec; // Added to cache parameters during early constructor execution
     TUint iPendingChannels;
     TUint iPendingSampleBytes;
-    std::vector<TByte> iInputBuffer;
-    std::vector<TByte> iRemainderBuffer;
+    std::vector<TByte>  iInputBuffer;
+    std::vector<TInt32> iTmpOut;
+    std::vector<TByte> iSilenceBuffer;
 };
 
 } // namespace Media
 } // namespace OpenHome
+
