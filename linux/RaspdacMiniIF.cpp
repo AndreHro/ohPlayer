@@ -1,13 +1,6 @@
-#if 0
+#include "OhLog.h"
 #include "RaspdacMiniIF.h"
-#include <OpenHome/Types.h>
-#include <OpenHome/Buffer.h>
-using namespace OpenHome;
-//using namespace OpenHome::Av;
-using namespace OpenHome::Media;
-
-#else
-#include "RaspdacMiniIF.h"
+#include "RadioNowPlaying.h"
 
 #include <OpenHome/Media/PipelineObserver.h>
 #include <OpenHome/Types.h>
@@ -25,16 +18,16 @@ using namespace OpenHome::Av;
 using namespace OpenHome::Net;
 
 
-#endif
-
 // RaspdacObserver
-RaspdacObserver::RaspdacObserver()
+RaspdacObserver::RaspdacObserver(Environment& aEnv, SslContext& aSsl, const Brx& aUserAgent)
 {
 	iOhMdpIF = OhMdpIF::getInstance();
+	iNowPlaying = new Av::RadioNowPlaying(aEnv, aSsl, aUserAgent, iOhMdpIF);
 }
 
 RaspdacObserver::~RaspdacObserver()
 {
+    delete iNowPlaying;
     delete(iOhMdpIF);
 }
 
@@ -53,6 +46,7 @@ void RaspdacObserver::NotifyPipelineState(EPipelineState aState)
     case EPipelineBuffering:
     case EPipelineWaiting:
         state = "stop";
+        iNowPlaying->SetStreamUri(Brx::Empty());
         break;
     default:
         ASSERTS();
@@ -69,43 +63,39 @@ void RaspdacObserver::NotifyMode(const Brx& /*aMode*/,
 {
 }
 
-#ifndef DEBUG_IF
-void RaspdacObserver::NotifyMetaText(const Brx& /* aText */)
-{}
-#else
 void RaspdacObserver::NotifyMetaText(const Brx& aText)
 {
-    Log::Print("MetaText : ");
-    const TByte* src = aText.Ptr();
-    for (TUint i=0; i<aText.Bytes(); i++) {
-       Log::Print("%02.02X ", src[i]);
+    // ICY StreamTitle updates arrive here as DIDL-Lite (<dc:title>...).
+    // Log the raw payload and the extracted title so we can see whether the
+    // radio stream actually sends show metadata and what it contains.
+    OhLog::PrintDebug("Raspdac: METATEXT (%u bytes): %.*s\n", aText.Bytes(), PBUF(aText));
+    Brn title;
+    if (XmlParserBasic::TryFind(Brn("title"), aText, title)) {
+        OhLog::PrintDebug("Raspdac: METATEXT title: %.*s\n", PBUF(title));
+        if (title.Bytes() > 0) {
+            // ICY StreamTitle (show/song) -> OLED artist line. Title stays the
+            // station name from setTrack(): overwriting it made the displayed
+            // title oscillate between station and song on every metadata block.
+            iOhMdpIF->setArtist(title);
+        }
     }
-    Log::Print("MetaText :\n");
+    else {
+        OhLog::PrintDebug("Raspdac: METATEXT without <title> element\n");
+    }
 }
-#endif    
 void RaspdacObserver::NotifyTime(TUint aSeconds)
 {
         iOhMdpIF->setTime(aSeconds);
 	
-        //Log::Print("Playing %02.02u:%02.02u/%02.02u:%02.02u\r",
+        //OhLog::Print("Playing %02.02u:%02.02u/%02.02u:%02.02u\r",
 	//	 aSeconds/60, aSeconds%60, aTrackDurationSeconds/60, aTrackDurationSeconds%60);
 }
 
 void RaspdacObserver::NotifyTrack(Track& aTrack, TBool aStartOfStream)
 {
-#ifdef DEBUG_IF
-    Log::Print("Pipeline report property: TRACK {uri=%.*s; trackId=%u; startOfStream=%u}\n",
-    PBUF(aTrack.Uri()), aTrack.Id(), aStartOfStream);
-
-    Log::Print("Track MetaData : %.*s\n", PBUF(aTrack.MetaData()));
-    const TByte* src = aTrack.MetaData();
-    for (TUint i=0; i<PBUF(aTrack.MetaData())->Bytes(); i++) {
-      Log::Print("%02.02X ", src[i]);
-    }
-    Log::Print("MetaText :\n");
-#endif
-
 Brn xmlBuffer(aTrack.MetaData()) ;
+OhLog::PrintDebug("Raspdac: TRACK startOfStream=%u uri=%.*s metadata(%u bytes): %.*s\n",
+                  (TUint)aStartOfStream, PBUF(aTrack.Uri()), xmlBuffer.Bytes(), PBUF(xmlBuffer));
 Brn aTitle;
 Brn aAlbumName;
 Brn aArtistName;
@@ -129,16 +119,19 @@ try {
 } catch (...) {aArtistName = Brn("");}
         
 iOhMdpIF->setTrack(aTitle, aArtistName, aAlbumName, aAlbumArtURI);
-Log::Print("Artist : %.*s Album : %.*s Track : %.*s\n URI : %.*s\n", PBUF(aArtistName), PBUF(aAlbumName), PBUF(aTitle), PBUF(aAlbumArtURI));
+        OhLog::PrintDebug("Raspdac: TRACK uri='%.*s'\n", PBUF(aTrack.Uri()));
+        iNowPlaying->SetStreamUri(aTrack.Uri());
+OhLog::Print("Raspdac: Artist: %.*s  Album: %.*s  Track: %.*s\n URI: %.*s\n", PBUF(aArtistName), PBUF(aAlbumName), PBUF(aTitle), PBUF(aAlbumArtURI));
 
 
 }
 void RaspdacObserver::NotifyStreamInfo(const DecodedStreamInfo& aStreamInfo)
 {
-    //iDurationSeconds = (TUint)(aStreamInfo.TrackLength() / Jiffies::kPerSecond);
-    Log::Print("Pipeline report property: FORMAT {bitRate=%u; bitDepth=%u, sampleRate=%u, numChannels=%u, codec=%.*s; trackLength=%llx, lossless=%u, channelConfig=%s}\n",
+    iOhMdpIF->setDuration((TUint)(aStreamInfo.TrackLength() / Jiffies::kPerSecond));
+    OhLog::Print("Raspdac: FORMAT {bitRate=%u; bitDepth=%u, sampleRate=%u, numChannels=%u, codec=%.*s; trackLength=%llx, lossless=%u, live=%u, seekable=%u, channelConfig=%s}\n",
                aStreamInfo.BitRate(), aStreamInfo.BitDepth(), aStreamInfo.SampleRate(), aStreamInfo.NumChannels(),
-               PBUF(aStreamInfo.CodecName()), aStreamInfo.TrackLength(), aStreamInfo.Lossless(), aStreamInfo.Profile().ToString());
+               PBUF(aStreamInfo.CodecName()), aStreamInfo.TrackLength(), aStreamInfo.Lossless(),
+               (TUint)aStreamInfo.Live(), (TUint)aStreamInfo.Seekable(), aStreamInfo.Profile().ToString());
     iOhMdpIF-> setStreamInfo(aStreamInfo.BitRate(), aStreamInfo.NumChannels(), aStreamInfo.BitDepth(), aStreamInfo.SampleRate());
 
 }
@@ -155,21 +148,3 @@ void RaspdacVolumeObserver::VolumeChanged(const IVolumeValue& aVolume)
 }
 
 
-// RaspdacMiniIF
-#if 0
-RaspdacMiniIF::RaspdacMiniIF(PipelineManager &pPipeline)
-{
-//   iRaspdacObserver = new RaspdacObserver();
- //  iPipelineManager = pPipeline;
-
-  //  iPipelineManager.AddObserver(*iRaspdacObserver);
-}
-RaspdacMiniIF::~RaspdacMiniIF()
-{
-    delete (iOhMdpIF);
-}
-int RaspdacMiniIF::test(int a)
-{
-  return a;
-}
-#endif

@@ -1,5 +1,8 @@
+#include "OhLog.h"
 #include "OpenHomePlayer.h"
 #include "TestMediaPlayer.h"
+#include "RadioNowPlayingTest.h"
+#include <OpenHome/Private/Network.h> // SslContext
 #include <OpenHome/Types.h>
 #include <OpenHome/Media/Tests/Cdecl.h>
 #include <OpenHome/Media/Tests/GetCh.h>
@@ -65,66 +68,40 @@ void TestMediaPlayerThread::RunInThread()
 //    OpenHome::Media::DriverAlsa     *driver  = NULL;
     iLib->StartCombined(adapter->Subnet(), cpStack, dvStack);
 
+    // --test-radio-meta: probe now-playing endpoints of test radio stations and exit
+    if (iOptions.TestRadioMeta().Value()) {
+        SslContext ssl;
+        Av::TestRadioNowPlaying(iLib->Env(), ssl, iOptions.UserAgent().Value());
+        adapter->RemoveRef(cookie);
+        return;
+    }
+
 
     // Seed random number generator.
     TestMediaPlayerInit::SeedRandomNumberGenerator(dvStack->Env(), iOptions.Room().Value(), adapter->Address(), dvStack->ServerUpnp());
     adapter->RemoveRef(cookie);
 
-    // Set/construct UDN.
-    Bwh udn;
-    // Note: prefix udn with 4c494e4e- to get older versions of Linn Konfig to recognise our devices
-    TestMediaPlayerInit::AppendUniqueId(dvStack->Env(), iOptions.Udn().Value(), Brn("TestMediaPlayer"), udn);
-    Log::Print("UDN is %.*s\n", PBUF(udn));
+    // The device UDN is derived in the TestMediaPlayer constructor: an
+    // explicit -u/--udn is used as provided, otherwise a canonical uuid is
+    // derived from the effective room (configured Product.Room, falling
+    // back to the -r argument).
 
-    Log::Print("%s:%d - %s\n", __FILE__, __LINE__, iOptions.Room().CString());
-    Log::Print("%s:%d - %s\n", __FILE__, __LINE__, iOptions.Name().CString());
-    Log::Print("%s:%d - %s\n", __FILE__, __LINE__, iOptions.TuneIn().CString());
-    Log::Print("%s:%d - %s\n", __FILE__, __LINE__, iOptions.Tidal().CString());
-    Log::Print("%s:%d - %s\n", __FILE__, __LINE__, iOptions.Qobuz().CString());
-    Log::Print("%s:%d - %s\n", __FILE__, __LINE__, iOptions.UserAgent().CString());
-    Log::Print("%s:%d - %s\n", __FILE__, __LINE__, iOptions.StoreFile().CString());
-    Log::Print("%s:%d - %u\n", __FILE__, __LINE__, iOptions.OptionOdp().Value());
-    Log::Print("%s:%d - %u\n", __FILE__, __LINE__, iOptions.OptionWebUi().Value());
+    OhLog::Print("Room: %s, Name: %s\n", iOptions.Room().CString(), iOptions.Name().CString());
+    OhLog::Print("TuneIn: %s, Tidal: %s, Qobuz: %s\n",
+        iOptions.TuneIn().CString(), iOptions.Tidal().CString(), iOptions.Qobuz().CString());
+    OhLog::Print("UserAgent: %s, StoreFile: %s\n",
+        iOptions.UserAgent().CString(), iOptions.StoreFile().CString());
+    OhLog::Print("ODP port: %u, Web UI port: %u\n",
+        iOptions.OptionOdp().Value(), iOptions.OptionWebUi().Value());
 
 
     // Create TestMediaPlayer.
-    tmp = new TestMediaPlayer(*dvStack, *cpStack, udn, iOptions.Room().CString(), iOptions.Name().CString(),
+    tmp = new TestMediaPlayer(*dvStack, *cpStack, iOptions.Udn().Value(), iOptions.Room().CString(), iOptions.Name().CString(),
         iOptions.TuneIn().Value(), iOptions.Tidal().Value(), iOptions.Qobuz().Value(),
-        iOptions.UserAgent().Value(), iOptions.StoreFile().CString(), iOptions.OptionOdp().Value(), iOptions.OptionWebUi().Value());
-    Log::Print("%s:%d\n", __FILE__, __LINE__);
-#if 0
-    // Add the audio driver to the pipeline.
-    //
-    // The 22052ms value a is a bit of a magic number which get's
-    // things going for the Hifiberry Digi+ card.
-    //
-    // FIXME This should be calculated.
-    driver = new DriverAlsa(tmp->Pipeline(), 22052);
-    if (driver == NULL)
-    {
-        Log::Print("%s:%d - Unable to start DriverAlsa\n", __FILE__, __LINE__);
-    }
-    else
-    {
-        Log::Print("%s:%d - DriverAlsa started !\n", __FILE__, __LINE__);
-    }
-    Log::Print("%s:%d\n", __FILE__, __LINE__);
-    Media::AnimatorBasic* animator = new Media::AnimatorBasic(
-        dvStack->Env(),
-        tmp->Pipeline(),
-        iOptions.ClockPull().Value(),
-        tmp->DsdMaxSampleRate(),
-        tmp->DsdSampleBlockWords(),
-        tmp->DsdPadBytesPerChunk());
-    Log::Print("%s:%d\n", __FILE__, __LINE__);
-    tmp->SetPullableClock(*animator);
- #endif
-    Log::Print("%s:%d\n", __FILE__, __LINE__);
+        iOptions.UserAgent().Value(), iOptions.StoreFile().CString(), iOptions.OptionOdp().Value(), iOptions.OptionWebUi().Value(), iOptions.RadioBrowser().Value());
     tmp->Run();
-    Log::Print("%s:%d\n", __FILE__, __LINE__);
+    OhLog::Print("Shutting down pipeline\n");
     tmp->StopPipeline();
-    Log::Print("%s:%d\n", __FILE__, __LINE__);
-    //delete animator;
     delete tmp;
 }
 #include<stdio.h>
@@ -134,6 +111,16 @@ void CDECL sig_handler(int signo);
 const gchar        *g_appName   = "OpenHomePlayer";
 int CDECL main(int aArgc, char* aArgv[])
 {
+    // Enable the ohPlayer application log level; OHP_DEBUG additionally
+    // enables debug-severity messages.
+    OhLog::SetDebugEnabled(false);
+    Debug::AddLevel(OhLog::kLevel);
+    {
+        const char* dbg = getenv("OHP_DEBUG");
+        if (dbg != nullptr && dbg[0] != '\0' && strcmp(dbg, "0") != 0) {
+            OhLog::SetDebugEnabled(true);
+        }
+    }
 #ifdef _WIN32
     char* noErrDlgs = getenv("NO_ERROR_DIALOGS");
     if (noErrDlgs != nullptr && strcmp(noErrDlgs, "1") == 0) {
@@ -159,7 +146,7 @@ void CDECL sig_handler(int signo)
   if (signo == SIGINT)
   {
     tmp->RequestExit();
-    printf("received SIGINT\n");
+    OhLog::Print("Received SIGINT\n");
   }
 }
 

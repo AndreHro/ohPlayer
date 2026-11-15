@@ -1,3 +1,4 @@
+#include "OhLog.h"
 // TCP Server text interface for OLED screen
 #include <OpenHome/Net/Private/Globals.h>
 #include <OpenHome/Types.h>
@@ -30,13 +31,9 @@ OhMdpIFSession::OhMdpIFSession(OhMdpIF* OhMdpIF)
 
 OhMdpIFSession::~OhMdpIFSession()
     {
-        //Log::Print("%s:%d - deleting \n",__FILE__, __LINE__);
         delete iReaderUntil;
-        //Log::Print("%s:%d - deleted \n",__FILE__, __LINE__);
         delete iStream;
-        //Log::Print("%s:%d - deleted \n",__FILE__, __LINE__);
-        //SocketTcpSession::~SocketTcpSession();
-        //Log::Print("%s:%d - deleted \n",__FILE__, __LINE__);
+        delete iWriteBuffer;
     }
 void  OhMdpIFSession::Run()
     {
@@ -69,18 +66,32 @@ void  OhMdpIFSession::Run()
 
         
 
+        // This session object is reused by the server accept loop for every
+        // connection: recreate the streams per connection, otherwise bytes
+        // left over from a previous client corrupt ReadUntil('\n') and
+        // commands are no longer recognised.
+        delete iReaderUntil;
+        delete iStream;
+        delete iWriteBuffer;
+        iStream = new Srs<200>(*this);
+        iReaderUntil = new ReaderUntilS<200>(*iStream);
+        iWriteBuffer = new Sws<kWriteBufferBytes>(*this);
+
         TBool done = false;
-        iWriteBuffer->Write(Brn("OK"));
-        iWriteBuffer->Write(EndOfLine);
-        iWriteBuffer->WriteFlush();
+        try {
+            iWriteBuffer->Write(Brn("OK"));
+            iWriteBuffer->Write(EndOfLine);
+            iWriteBuffer->WriteFlush();
+        }
+        catch (WriterError&) {
+            return; // client already gone
+        }
 
         while (!done) {
             try {
                 Brn buf = iReaderUntil->ReadUntil('\n');
-                //Log::Print("buf received : "); Log::Print(buf);
 		if (buf.Equals(statusCommand)||buf.Equals(statusCommandDos))
                 {
-                  //Log::Print("status received");
                   sprintf(aBuff, "%u", iParentOhMdpIF->iVolume);
                   iWriteBuffer->Write(volumeHdr);iWriteBuffer->Write(Brn(aBuff));iWriteBuffer->Write(EndOfLine);
                    
@@ -99,8 +110,6 @@ void  OhMdpIFSession::Run()
                 }
 		else if (buf.Equals(currentSongCommand)||buf.Equals(currentSongCommandDos))
                 {
-                  //Log::Print("current received");
-
                   iWriteBuffer->Write(titleHdr);
                   iWriteBuffer->Write(iParentOhMdpIF->iTitle);
                   iWriteBuffer->Write(EndOfLine);
@@ -122,7 +131,10 @@ void  OhMdpIFSession::Run()
                     done = true;
             }
             catch (ReaderError&) {
-                break;
+                break; // client closed the connection
+            }
+            catch (WriterError&) {
+                break; // client disconnected mid-response: writes to the socket throw
             }
         }
     }
@@ -130,12 +142,25 @@ void  OhMdpIFSession::Run()
 void OhMdpIF::setTime(TUint anElapsed)
 {
   iElapsed = anElapsed;
-  iDuration = 0;
+}
+
+void OhMdpIF::setDuration(TUint aDuration)
+{
+  iDuration = aDuration;
+}
+
+// Owning copy of a Brx into a Bwh member: Bwh(const Brx&) allocates the exact
+// size, Swap exchanges buffers (O(1), never overflows - unlike Replace() on a
+// default Bwh whose MaxBytes is 0, which would throw BufferOverflow/ASSERTS).
+static void CopyTo(Bwh& aDest, const Brx& aSrc)
+{
+    Bwh tmp(aSrc);
+    aDest.Swap(tmp);
 }
 
 void OhMdpIF::setMode(Brn aMode)
 {
-  iMode = aMode;
+  CopyTo(iMode, aMode);
 }
 
 void OhMdpIF::setVolume(OpenHome::TUint aVolume)
@@ -153,10 +178,25 @@ void OhMdpIF::setStreamInfo(TUint aBitRate, TUint aChannelNum, TUint aBitDepth, 
 
 void OhMdpIF::setTrack(Brn aTitle, Brn anArtist, Brn anAlbum, Brn anAlbumArtURI)
 {
-   iTitle = aTitle;
-   iArtist = anArtist;
-   iAlbum = anAlbum;
-   iAlbumArtURI = anAlbumArtURI;
+   CopyTo(iTitle, aTitle);
+   CopyTo(iArtist, anArtist);
+   CopyTo(iAlbum, anAlbum);
+   CopyTo(iAlbumArtURI, anAlbumArtURI);
+   iDuration = 0;
+   OhLog::Print("OhMdpIF: setTrack title='%.*s' artist='%.*s' album='%.*s' art='%.*s'\n",
+               PBUF(aTitle), PBUF(anArtist), PBUF(anAlbum), PBUF(anAlbumArtURI));
+}
+
+void OhMdpIF::setTitle(Brn aTitle)
+{
+   CopyTo(iTitle, aTitle);
+   OhLog::Print("OhMdpIF: setTitle '%.*s'\n", PBUF(aTitle));
+}
+
+void OhMdpIF::setArtist(Brn aArtist)
+{
+   CopyTo(iArtist, aArtist);
+   OhLog::Print("OhMdpIF: setArtist '%.*s'\n", PBUF(aArtist));
 }
 
 
@@ -172,11 +212,6 @@ OhMdpIF * OhMdpIF::getInstance()
 }
 OhMdpIF::~OhMdpIF()
 {
-   //Log::Print("%s:%d - deleting iServer\n",__FILE__, __LINE__);
-   //delete iServer;
-   //Log::Print("%s:%d - iServer deleted\n",__FILE__, __LINE__);
-   //delete iSession;
-   //Log::Print("%s:%d - iSession deleted\n",__FILE__, __LINE__);
 }
 
 OhMdpIF::OhMdpIF()
@@ -188,14 +223,25 @@ OhMdpIF::OhMdpIF()
 
     ASSERT(ifs->size() > 0);
 
-    TIpAddress addr = (*ifs)[1]->Address();
+    // The OLED TCP server is loopback-only by design (the display talks to the
+    // device locally): pick the loopback adapter explicitly instead of a
+    // hardcoded index, so the bind address does not depend on the adapter
+    // enumeration order.
+    TIpAddress addr = (*ifs)[0]->Address();
+    for (TUint i = 0; i < ifs->size(); i++) {
+        const TIpAddress& candidate = (*ifs)[i]->Address();
+        if (TIpAddressUtils::IsLoopback(candidate)) {
+            addr = candidate;
+            break;
+        }
+    }
     Endpoint endpt(0, addr);
     Endpoint::AddressBuf buf;
     endpt.AppendAddress(buf);
 
     Endpoint::AddressBuf myBuf;
     TIpAddressUtils::ToString(addr, myBuf);
-    Log::Print("Using network interface %.*s\n\n", PBUF(myBuf));
+    OhLog::Print("Using network interface %.*s\n\n", PBUF(myBuf));
 
 #if 1
     for (TUint i=0; i<ifs->size(); i++) {
@@ -205,18 +251,28 @@ OhMdpIF::OhMdpIF()
     //delete ifs;
 
     iDuration   = 0;
-    iElapsed    = 0; 
+    iElapsed    = 0;
     iBitRate    = 0;
     iChannelNum = 0;
     iBitDepth   = 0;
     iSampleFreq = 0;
-
-    iMode = Brn("stop");
+    iVolume     = 0;
+    // Bwh members default to empty (0 bytes) - safe to read before the first
+    // setter. NOTE: do NOT use Replace() on a default Bwh: MaxBytes is 0, so any
+    // non-empty value would throw BufferOverflow (ASSERTS in debug builds).
+    CopyTo(iMode, Brn("stop"));
     Semaphore sem("", 0);
 
     iServer = new SocketTcpServer(*gEnv, "OHMDP", 6600, addr);
-    iSession = new OhMdpIFSession(this);
-    iServer->Add("OHMDP", iSession);
+    // Register several session objects: each Add() starts its own accept
+    // thread, so several clients (OLED display + terminal) can be connected
+    // at the same time. With a single session, a second client would sit in
+    // the listen backlog forever (connected, but never served).
+    static const TUint kMaxSessions = 4;
+    for (TUint i = 0; i < kMaxSessions; i++) {
+        iSession = new OhMdpIFSession(this);
+        iServer->Add("OHMDP", iSession);
+    }
 
     //sem.Wait();
     //delete ifs;

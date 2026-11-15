@@ -1,10 +1,13 @@
 #include "OhLog.h"
 #include "TestMediaPlayer.h"
 #include "RaspdacMiniIF.h"
-#include "OhLinnAmpVolume.h"
-#include "LinnAmpConfig.h"
+#include "LinnAmp/OhLinnAmpVolume.h"
+#include "LinnAmp/LinnAmpConfig.h"
+#include "PipelineConfig.h"
+#include "CrashSymboliser.h"
+#include "RadioPresetsStatic.h"
 #include "StoreWithOverriddenValue.h"
-#include "ConfigAppPlayerLinn.h"
+#include "ConfigUI/ConfigAppPlayerLinn.h"
 #include <OpenHome/Types.h>
 #include <OpenHome/Net/Private/DviStack.h>
 #include <cstdlib>
@@ -21,6 +24,8 @@
 #include <OpenHome/Media/Codec/ContainerFactory.h>
 #include <OpenHome/Media/Protocol/ProtocolFactory.h>
 #include <OpenHome/Av/SourceFactory.h>
+#include <OpenHome/Av/Radio/RadioPins.h>
+#include <OpenHome/Av/Pins/UrlPins.h>
 #include <OpenHome/Av/KvpStore.h>
 //#include "RamStore.h"
 #include <OpenHome/Av/UpnpAv/UpnpAv.h>
@@ -124,17 +129,17 @@ IVolumeProfile::StartupVolume VolumeProfile::StartupVolumeConfig() const
 
 void VolumeSinkLogger::SetVolume(TUint aVolume)
 {
-    Log::Print("SetVolume: %u\n", aVolume);
+    OhLog::Print("SetVolume: %u\n", aVolume);
 }
 
 void VolumeSinkLogger::SetBalance(TInt aBalance)
 {
-    Log::Print("SetBalance: %d\n", aBalance);
+    OhLog::Print("SetBalance: %d\n", aBalance);
 }
 
 void VolumeSinkLogger::SetFade(TInt aFade)
 {
-    Log::Print("SetFade: %d\n", aFade);
+    OhLog::Print("SetFade: %d\n", aFade);
 }
 
 
@@ -142,10 +147,53 @@ void VolumeSinkLogger::SetFade(TInt aFade)
 
 void RebootLogger::Reboot(const Brx& aReason)
 {
-    Log::Print("\n\n\nRebootLogger::Reboot. Reason:\n%.*s\n\n\n", PBUF(aReason));
+    OhLog::Print("\n\n\nRebootLogger::Reboot. Reason:\n%.*s\n\n\n", PBUF(aReason));
     // Exit the process; systemd (ohPlayer.service, Restart=always) restarts it.
     fflush(stdout);
     _exit(0);
+}
+
+// SongcastLatencyLogger
+
+SongcastLatencyLogger::SongcastLatencyLogger(TUint aDownstreamJiffies)
+    : iDownstreamJiffies(aDownstreamJiffies)
+    , iLastLatency(UINT_MAX)
+{
+}
+
+void SongcastLatencyLogger::Process(OhmMsgAudio& aMsg)
+{
+    const TUint latency = aMsg.MediaLatency();
+    if (latency != iLastLatency) {
+        iLastLatency = latency;
+        // Same conversion as ProtocolOhBase applies before injecting the
+        // MsgDelay that the PhaseAdjuster matches against.
+        const TUint delayJiffies = (TUint)Jiffies::FromSongcastTime(latency, aMsg.SampleRate());
+        // Print (info): a latency change marks a stream lifecycle event, and
+        // PrintDebug was observed not to reach the output on this build.
+        OhLog::Print("Songcast: sender media latency = %u (songcast time) = %u jiffies (~%ums) @ %uHz\n",
+                    latency, delayJiffies, delayJiffies / Jiffies::kPerMs, aMsg.SampleRate());
+        CheckTarget(delayJiffies);
+    }
+}
+
+void SongcastLatencyLogger::CheckTarget(TUint aTargetJiffies)
+{
+    if (iDownstreamJiffies > aTargetJiffies) {
+        OhLog::PrintWarning("Songcast: downstream buffers (~%ums) exceed the sender's target (~%ums): "
+                            "multiroom offset cannot be compensated - reduce StarvationRamperMinSize "
+                            "or the Driver ALSA Buffer\n",
+                            iDownstreamJiffies / Jiffies::kPerMs,
+                            aTargetJiffies / Jiffies::kPerMs);
+    }
+}
+
+void SongcastLatencyLogger::Process(OhmMsgTrack& /*aMsg*/)
+{
+}
+
+void SongcastLatencyLogger::Process(OhmMsgMetatext& /*aMsg*/)
+{
 }
 
 
@@ -176,7 +224,7 @@ const TUint TestMediaPlayer::kDsdPadBytesPerChunk;
 
 TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack, const Brx& aUdn, const TChar* aRoom, const TChar* aProductName,
                                  const Brx& aTuneInPartnerId, const Brx& aTidalId, const Brx& aQobuzIdSecret, const Brx& aUserAgent,
-                                 const TChar* aStoreFile, TUint aOdpPort, TUint aWebUiPort,
+                                 const TChar* aStoreFile, TUint aOdpPort, TUint aWebUiPort, TBool aEnableRadioBrowser,
                                  TUint aMinWebUiResourceThreads, TUint aMaxWebUiTabs, TUint aUiSendQueueSize,
                                  TUint aUiMsgBufCount, TUint aUiMsgBufBytes)
     : iPullableClock(nullptr)
@@ -201,8 +249,46 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
     , iUiMsgBufBytes(aUiMsgBufBytes)
     , iLinnAmpVolume(nullptr)
 {
-    Log::Print("Shell running on port %u\n", aDvStack.Env().Shell()->Port());
+    OhLog::Print("Shell running on port %u\n", aDvStack.Env().Shell()->Port());
     iInfoLogger = std::make_unique<Media::AllocatorInfoLogger>();
+
+    // Create the read/write store before the UPnP devices: the device UDN is
+    // derived from the effective room (Product.Room from the store, falling
+    // back to the -r argument), so the store must be loaded first.
+    iRamStore = std::make_unique<RamStore>(kSongcastSenderIconFileName);
+    iConfigRamStore = std::make_unique<ConfigRamStore>();
+    if (Brn(aStoreFile).Bytes() > 0) {
+        StoreFileReaderJson storeFileReader(aStoreFile);
+        storeFileReader.Read(*iConfigRamStore);
+
+        iStoreFileWriter = std::make_unique<StoreFileWriterJson>(aStoreFile);
+        iConfigRamStore->AddStoreObserver(*iStoreFileWriter);
+    }
+    else {
+        OhLog::Print("No store file parameter specified - will not attempt to load store values from file, and changes to store values will not be persisted.\n");
+    }
+
+    // Derive the device UDN.
+    Bwh udn;
+    if (aUdn.Bytes() > 0) {
+        // Explicit -u/--udn: use as provided.
+        udn.Replace(aUdn);
+    }
+    else {
+        // Canonical uuid from the effective room: the configured room
+        // (Product.Room from the store) when set, else the -r argument.
+        // Keeps the device identity distinct per room and stable over time.
+        Bws<Product::kMaxRoomBytes> roomBuf;
+        static const Brn kKeyProductRoom("Product.Room");
+        try {
+            iConfigRamStore->Read(kKeyProductRoom, roomBuf);
+        }
+        catch (StoreKeyNotFound&) {
+            roomBuf.Replace(Brn(aRoom));
+        }
+        TestMediaPlayerInit::CreateCanonicalUuid(roomBuf, udn);
+    }
+    OhLog::Print("UDN is %.*s\n", PBUF(udn));
 
     // Do NOT set UPnP friendly name attributes at this stage.
     // (Wait until MediaPlayer is created so that friendly name can be observed.)
@@ -211,7 +297,7 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
 
     // Create UPnP device.
     // Friendly name not set here.
-    iDevice = std::make_unique<DvDeviceStandard>(aDvStack, aUdn, static_cast<Net::IResourceManager&>(*this));
+    iDevice = std::make_unique<DvDeviceStandard>(aDvStack, udn, static_cast<Net::IResourceManager&>(*this));
     iDevice->SetAttribute("Upnp.Domain", "av.openhome.org");
     iDevice->SetAttribute("Upnp.Type", "Source");
     iDevice->SetAttribute("Upnp.Version", "1");
@@ -223,7 +309,7 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
     iDevice->SetAttribute("Odp.Name", "Ds");
 
     // Create separate UPnP device for standard MediaRenderer.
-    Bws<256> buf(aUdn);
+    Bws<256> buf(udn);
     buf.Append("-MediaRenderer");
     iDeviceUpnpAv = std::make_unique<DvDeviceStandard>(aDvStack, buf);
     // Friendly name not set here.
@@ -236,22 +322,6 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
     iDeviceUpnpAv->SetAttribute("Lpec.Name", "MediaRenderer");
 #endif
     iDeviceUpnpAv->SetAttribute("Odp.Name", "MediaRenderer");
-
-    // create read/write store.  This creates a number of static (constant) entries automatically
-    iRamStore = std::make_unique<RamStore>(kSongcastSenderIconFileName);
-
-    // create a read/write store using the new config framework
-    iConfigRamStore = std::make_unique<ConfigRamStore>();
-    if (Brn(aStoreFile).Bytes() > 0) {
-        StoreFileReaderJson storeFileReader(aStoreFile);
-        storeFileReader.Read(*iConfigRamStore);
-
-        iStoreFileWriter = std::make_unique<StoreFileWriterJson>(aStoreFile);
-        iConfigRamStore->AddStoreObserver(*iStoreFileWriter);
-    }
-    else {
-        Log::Print("No store file parameter specified - will not attempt to load store values from file, and changes to store values will not be persisted.\n");
-    }
 
     VolumeProfile volumeProfile;
     VolumeConsumer volumeInit;
@@ -279,7 +349,8 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
         // External Linn amplifier over RS232.
         std::string serialPortStr(reinterpret_cast<const char*>(serialPortBuf.Ptr()), serialPortBuf.Bytes());
         const TUint volumeLimit = LinnAmpConfig::ReadVolumeLimitFromStore(*iConfigRamStore, 100);
-        iLinnAmpVolume = new OhLinnAmpVolume(serialPortStr, volumeLimit);
+        const TInt listenSource = LinnAmpConfig::ReadSourceFromStore(*iConfigRamStore, LinnAmpConfig::kSourceMin);
+        iLinnAmpVolume = new OhLinnAmpVolume(serialPortStr, volumeLimit, static_cast<TUint>(listenSource));
         if (iLinnAmpVolume->IsVolumeSupported()) {
             // Set the ALSA output level: attenuation is handled by the Linn amp
             const TUint alsaVolume = LinnAmpConfig::ReadAlsaVolumeFromStore(*iConfigRamStore, 100);
@@ -293,14 +364,14 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
             iLinnAmpVolume->SetBass(bass);
             iLinnAmpVolume->SetTreble(treble);
             linnAmpUsed = true;
-            Log::Print("Using Linn Amp volume control on %s\n", serialPortStr.c_str());
+            OhLog::Print("Using Linn Amp volume control on %s\n", serialPortStr.c_str());
         } else {
             delete iLinnAmpVolume;
             iLinnAmpVolume = nullptr;
             // No amplifier detected: grey out the volume in control points.
             // Volume.Enabled already reads No, so the greyed-out state is
             // announced and persists to the next start.
-            Log::Print("Linn Amp volume control failed - volume disabled\n");
+            OhLog::PrintError("TestMediaPlayer: Linn Amp volume control failed - volume disabled\n");
             volumeInit.SetVolume(iVolumeSinkLogger);
             volumeInit.SetBalance(iVolumeSinkLogger);
             volumeInit.SetFade(iVolumeSinkLogger);
@@ -316,7 +387,7 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
             // Grey out the volume in control points by disabling Volume.Enabled
             // before the MediaPlayer is created (ohPipeline only announces the
             // Volume attribute when internal volume control is enabled).
-            Log::Print("Internal volume control enabled but sound card has no mixer - volume disabled\n");
+            OhLog::PrintWarning("TestMediaPlayer: sound card has no mixer - volume disabled\n");
             LinnAmpConfig::WriteVolumeControlEnabled(*iConfigRamStore, false);
             volumeInit.SetVolume(iVolumeSinkLogger);
             volumeInit.SetBalance(iVolumeSinkLogger);
@@ -324,7 +395,7 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
         }
     } else {
         // Volume control disabled and no external amplifier: greyed out.
-        Log::Print("Internal volume control disabled - volume greyed out\n");
+        OhLog::Print("Internal volume control disabled - volume greyed out\n");
         volumeInit.SetVolume(iVolumeSinkLogger);
         volumeInit.SetBalance(iVolumeSinkLogger);
         volumeInit.SetFade(iVolumeSinkLogger);
@@ -333,9 +404,23 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
     // Create MediaPlayer.
     // NOTE: If values for Room.Name and Product.Name already exist in the Store,
     //       the aRoom and aProductName default values will be ignored.
+    // Pipeline buffer tuning (web config UI, Songcast tab). Values are read from
+    // the store so that changes made in the web config UI are applied at the next
+    // start.
+    const TUint starvationRamperMinJiffies = PipelineConfig::ReadStarvationRamperMinSizeJiffiesFromStore(*iConfigRamStore);
+    const TUint encodedReservoirBytes = PipelineConfig::ReadEncodedReservoirSizeBytesFromStore(*iConfigRamStore);
+    const TUint alsaBufferUs = PipelineConfig::ReadAlsaBufferUsFromStore(*iConfigRamStore);
+    OhLog::Print("Pipeline buffers: StarvationRamperMinSize=%u jiffies (~%ums), EncodedReservoirSize=%u bytes, AlsaBuffer=%u us (~%ums)\n",
+               starvationRamperMinJiffies, starvationRamperMinJiffies / Jiffies::kPerMs,
+               encodedReservoirBytes, alsaBufferUs, alsaBufferUs / 1000);
+    // Downstream latency fed to the Songcast target check (ramper + ALSA).
+    const TUint downstreamJiffies = starvationRamperMinJiffies
+                                  + (alsaBufferUs * Jiffies::kPerMs) / 1000;
+    iSongcastLatencyLogger = std::make_unique<SongcastLatencyLogger>(downstreamJiffies);
     auto pipelineInit = PipelineInitParams::New();
-    pipelineInit->SetStarvationRamperMinSize(100 * Jiffies::kPerMs); // larger StarvationRamper size useful for desktop
+    pipelineInit->SetStarvationRamperMinSize(starvationRamperMinJiffies); // larger StarvationRamper size useful for desktop
                                                                      // platforms with slightly unpredictable thread scheduling
+    pipelineInit->SetEncodedReservoirSize(encodedReservoirBytes);
     pipelineInit->SetGorgerDuration(pipelineInit->DecodedReservoirJiffies());
     pipelineInit->SetDsdMaxSampleRate(kDsdMaxSampleRate);
     pipelineInit->SetSupportElements(Media::EPipelineSupportElementsValidatorMinimal | Media::EPipelineSupportElementsDecodedAudioValidator | Media::EPipelineSupportElementsRampValidator);
@@ -362,38 +447,92 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
                                    mediaPlayerStore, pipelineInit, *iAudioTime,
                                    volumeInit, volumeProfile,
                                    *iInfoLogger,
-                                   aUdn, mpInit);
+                                   udn, mpInit);
     delete mpInit;
+
+    // Radio Browser media server: exposes the community radio directory
+    // (radio-browser.info) to UPnP/DLNA control points for browsing/search;
+    // stations play on this renderer through its usual protocols (http/hls).
+    if (aEnableRadioBrowser) {
+        // UPnP MediaServer UDN must be a canonical uuid (8-4-4-4-12 hex);
+        // some control points (e.g. Linn app) ignore devices whose UDN is not
+        // a well-formed uuid. Derive a stable one from the renderer udn.
+        // DvDeviceStandard adds the "uuid:" prefix itself; pass the bare uuid.
+        Bws<64> radioBrowserUdn;
+        {
+            // simple deterministic 128-bit hash of the renderer udn (FNV-1a x2)
+            TUint64 h1 = 0xcbf29ce484222325ULL;
+            TUint64 h2 = 0x9e3779b97f4a7c15ULL;
+            for (TUint i = 0; i < udn.Bytes(); i++) {
+                h1 ^= udn[i]; h1 *= 0x100000001b3ULL;
+                h2 ^= (TUint64(udn[i]) << 32) | udn[i]; h2 *= 0x100000001b3ULL;
+            }
+            const TUint64 ms[] = { h1, h2 };
+            const TByte* p = reinterpret_cast<const TByte*>(ms);
+            for (TUint i = 0; i < 16; i++) {
+                if (i == 4 || i == 6 || i == 8 || i == 10) {
+                    radioBrowserUdn.Append('-');
+                }
+                Ascii::AppendHex(radioBrowserUdn, p[i]);
+            }
+        }
+        // Friendly name: use the effective room from the store (Product.Room
+        // is where the web ui / Product store it); fall back to the -r arg.
+        Bws<Product::kMaxRoomBytes> roomBuf;
+        static const Brn kKeyProductRoom("Product.Room");
+        try {
+            iConfigRamStore->Read(kKeyProductRoom, roomBuf);
+        }
+        catch (StoreKeyNotFound&) {
+            roomBuf.Replace(Brn(aRoom));
+        }
+        iRadioBrowserMediaServer = std::make_unique<RadioBrowserMediaServer>(
+            aDvStack, iMediaPlayer->Env(), iMediaPlayer->Ssl(), iUserAgent,
+            radioBrowserUdn, Brn(roomBuf.Ptr(), roomBuf.Bytes()));
+        iRadioBrowserMediaServer->Start();
+    }
 
     // Register Linn Amp web config parameters (volume control choice and serial port)
     iLinnAmpConfig = std::make_unique<LinnAmpConfig>(iMediaPlayer->ConfigInitialiser());
+
+    // Register pipeline buffer web config parameters (applied at next start)
+    iPipelineConfig = std::make_unique<PipelineConfig>(iMediaPlayer->ConfigInitialiser());
+
+    // Create the static radio preset provider here so its config values are
+    // registered before the web config app is created (AddConfigApp runs in
+    // Run()). The provider itself is registered with MediaPlayer's
+    // RadioPresets in InitialiseSubsystems, after the Radio source is added.
+    iRadioPresetsStatic = std::make_unique<RadioPresetsStatic>(iMediaPlayer->ConfigInitialiser());
     
-    iDriver = std::make_unique<DriverAlsa>(iMediaPlayer->Pipeline(), 22052);
+    iDriver = std::make_unique<DriverAlsa>(iMediaPlayer->Pipeline(),
+                                           PipelineConfig::ReadAlsaBufferUsFromStore(*iConfigRamStore));
 #if 1
     if (iDriver == NULL)
     {
-        Log::Print("%s:%d - Unable to start DriverAlsa\n", __FILE__, __LINE__);
+        OhLog::PrintError("TestMediaPlayer: unable to start DriverAlsa\n");
     }
     else
     {
-        Log::Print("%s:%d - DriverAlsa started !\n", __FILE__, __LINE__);
+        OhLog::Print("TestMediaPlayer: DriverAlsa started\n");
     }
 #endif
-    iPipelineObserver = std::make_unique<LoggingPipelineObserver>();
-    iMediaPlayer->Pipeline().AddObserver(*iPipelineObserver);
-    Log::Print("%s:%d\n", __FILE__, __LINE__);
+    // Attach the pipeline logging observer only in debug mode: it logs every
+    // pipeline event (TRACK/METATEXT/FORMAT/TIME each second) at kEssential,
+    // and the now-playing info is already covered by the Raspdac observer.
+    if (OhLog::IsDebugEnabled()) {
+        iPipelineObserver = std::make_unique<LoggingPipelineObserver>();
+        iMediaPlayer->Pipeline().AddObserver(*iPipelineObserver);
+    }
     iFnUpdaterStandard = std::make_unique<FriendlyNameAttributeUpdater>(iMediaPlayer->FriendlyNameObservable(), iMediaPlayer->ThreadPool(), *iDevice);
     iFnManagerUpnpAv =  std::make_unique<FriendlyNameManagerUpnpAv>(kFriendlyNamePrefix, iMediaPlayer->Product());
     iFnUpdaterUpnpAv = std::make_unique<FriendlyNameAttributeUpdater>(*iFnManagerUpnpAv, iMediaPlayer->ThreadPool(), *iDeviceUpnpAv);
     iFsFlushPeriodic = std::make_unique<FsFlushPeriodic>(iMediaPlayer->Env(), iMediaPlayer->PowerManager(), iMediaPlayer->ThreadPool(), kFsFlushFreqMs);
-    Log::Print("%s:%d\n", __FILE__, __LINE__);
     // Register with the PowerManager
     IPowerManager& powerManager = iMediaPlayer->PowerManager();
     iPowerObserver = powerManager.RegisterPowerHandler(*this, kPowerPriorityLowest, "TestMediaPlayer");
     iStandbyObserver = powerManager.RegisterStandbyHandler(*this, kStandbyHandlerPriorityNormal, "TestMediaPlayer");
-    Log::Print("%s:%d\n", __FILE__, __LINE__);
     // Register Raspdac interface notification
-    iRaspdacObserver = std::make_unique<RaspdacObserver>();
+    iRaspdacObserver = std::make_unique<RaspdacObserver>(iMediaPlayer->Env(), iMediaPlayer->Ssl(), iUserAgent);
     iMediaPlayer->Pipeline().AddObserver(*iRaspdacObserver);
     iRaspdacVolumeObserver = std::make_unique<RaspdacVolumeObserver>();
     iMediaPlayer->VolumeManager().AddVolumeObserver(*iRaspdacVolumeObserver);
@@ -406,7 +545,6 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
     initParams->SetMaxServerThreadsLongPoll(aMaxWebUiTabs);
     initParams->SetSendQueueSize(aUiSendQueueSize);
     iAppFramework = std::make_unique<WebAppFramework>(aDvStack.Env(), initParams, iMediaPlayer->ThreadPool());
-    Log::Print("%s:%d\n", __FILE__, __LINE__);
 }
 
 TestMediaPlayer::~TestMediaPlayer()
@@ -484,7 +622,7 @@ void TestMediaPlayer::Run()
 
     iServerOdp = std::make_unique<DviServerOdp>(iMediaPlayer->DvStack(), kNumOdpSessions, iOdpPort);
     iServerOdp->Start();
-    Log::Print("ODP server running on port %u\n", iServerOdp->Port()); // don't use iOdpPort here - if it is 0, iServerOdp->Port() tells us the host assigned port
+    OhLog::Print("ODP server running on port %u\n", iServerOdp->Port()); // don't use iOdpPort here - if it is 0, iServerOdp->Port() tells us the host assigned port
     iOdpZeroConf =std::make_unique<OdpZeroConf>(iMediaPlayer->Env(), *iServerOdp, iMediaPlayer->FriendlyNameObservable());
     iOdpZeroConf->SetZeroConfEnabled(true);
 
@@ -494,11 +632,11 @@ void TestMediaPlayer::Run()
     StorePrinter storePrinter(*iConfigRamStore);
     storePrinter.Print();
 
-    Log::Print("\nFull (software) media player\n");
-    Log::Print("Intended to be controlled via a separate, standard CP (Kazoo etc.)\n");
+    OhLog::Print("\nFull (software) media player\n");
+    OhLog::Print("Intended to be controlled via a separate, standard CP (Kazoo etc.)\n");
 
-    Log::Print("Press CTRL+C to quit:\n");
-    Log::Print("\n");
+    OhLog::Print("Press CTRL+C to quit:\n");
+    OhLog::Print("\n");
 #if 1
     iSemShutdown.Wait();
 #else    
@@ -622,10 +760,10 @@ void TestMediaPlayer::RegisterPlugins(Environment& aEnv)
             apps.push_back(OAuthAppDetails(appId, appClientId, appClientSecret));
         }
 
-        Log::Print("TIDAL: clientId = %.*s, clientSecret = %.*s\n", PBUF(clientId), PBUF(clientSecret));
+        OhLog::Print("TIDAL: clientId = %.*s, clientSecret = %.*s\n", PBUF(clientId), PBUF(clientSecret));
         for(const auto& v : apps)
         {
-            Log::Print("    App: ID: %.*s - ClientId = %.*s, Secret = %.*s\n", PBUF(v.AppId()), PBUF(v.ClientId()), PBUF(v.ClientSecret()));
+            OhLog::Print("    App: ID: %.*s - ClientId = %.*s, Secret = %.*s\n", PBUF(v.AppId()), PBUF(v.ClientId()), PBUF(v.ClientSecret()));
         }
 
         iMediaPlayer->Add(ProtocolFactory::NewTidal(ssl, clientId, clientSecret, apps, *iMediaPlayer));
@@ -635,11 +773,7 @@ void TestMediaPlayer::RegisterPlugins(Environment& aEnv)
         Parser p(iQobuzIdSecret);
         Brn appId(p.Next(':'));
         Brn appSecret(p.Remaining());
-        Log::Print("Qobuz: appId = ");
-        Log::Print(appId);
-        Log::Print(", appSecret = ");
-        Log::Print(appSecret);
-        Log::Print("\n");
+        OhLog::Print("Qobuz: appId = %.*s, appSecret = %.*s\n", PBUF(appId), PBUF(appSecret));
         iMediaPlayer->Add(ProtocolFactory::NewQobuz(appId, appSecret, *iMediaPlayer, iUserAgent));
     }
     iMediaPlayer->Add(ProtocolFactory::NewCalmRadio(aEnv, ssl, iUserAgent, *iMediaPlayer));
@@ -651,6 +785,28 @@ void TestMediaPlayer::RegisterPlugins(Environment& aEnv)
     }
     else {
         iMediaPlayer->Add(SourceFactory::NewRadio(*iMediaPlayer, iTuneInPartnerId));
+    }
+    // Register the static station list (Radio France) as a radio preset provider.
+    // Selectable in the web config ui (Radio.PresetProvider) alongside TuneIn
+    // when configured. Must be added after the Radio source and before the
+    // pipeline starts (RadioPresets::Start runs on SourceRadio::Started).
+    auto radioPresets = iMediaPlayer->RadioPresets();
+    if (radioPresets.Ok()) {
+        // RadioPresets takes ownership of the provider (deletes it in its
+        // destructor), so release our unique_ptr when handing it over.
+        radioPresets.Unwrap().AddProvider(iRadioPresetsStatic.release());
+    }
+
+    // Register radio/url pin invokers so radio presets and stream urls can be
+    // pinned from control point apps. ohPipeline registers these itself when a
+    // TuneIn partner id is configured (SourceRadio.cpp); register them here
+    // only in the TuneIn-less case - PinsManager::Add asserts on duplicate
+    // modes (Pins.cpp). PinsInvocable takes ownership of the invokers
+    // (deletes them in its destructor).
+    auto pinsInvocable = iMediaPlayer->PinsInvocable();
+    if (pinsInvocable.Ok() && iTuneInPartnerId.Bytes() == 0) {
+        pinsInvocable.Unwrap().Add(new RadioPins(*iDevice, iMediaPlayer->CpStack()));
+        pinsInvocable.Unwrap().Add(new UrlPins(*iDevice, iMediaPlayer->CpStack(), iMediaPlayer->ThreadPool()));
     }
 
     iMediaPlayer->Add(SourceFactory::NewUpnpAv(*iMediaPlayer, *iDeviceUpnpAv));
@@ -672,7 +828,7 @@ void TestMediaPlayer::RegisterPlugins(Environment& aEnv)
                                                  Optional<IClockPuller>(nullptr),
                                                  Optional<IOhmTimestamper>(iTxTimestamper),
                                                  Optional<IOhmTimestamper>(iRxTimestamper),
-                                                 Optional<IOhmMsgProcessor>()));
+                                                 Optional<IOhmMsgProcessor>(*iSongcastLatencyLogger)));
 
 #ifdef RAAT_ENABLE
     ASSERT(iPullableClock != nullptr);
@@ -699,12 +855,14 @@ IWebApp* TestMediaPlayer::CreateConfigApp(const std::vector<const Brx*>& aSource
     FileResourceHandlerFactory resourceHandlerFactory;
     Brn linnAmpModel(iLinnAmpVolume != nullptr ? iLinnAmpVolume->DeviceModel() : Brx::Empty());
     Brn linnAmpSerial(iLinnAmpVolume != nullptr ? iLinnAmpVolume->DeviceId() : Brx::Empty());
+    Brn linnAmpHwVersion(iLinnAmpVolume != nullptr ? iLinnAmpVolume->DeviceHwVersion() : Brx::Empty());
+    Brn linnAmpSwVersion(iLinnAmpVolume != nullptr ? iLinnAmpVolume->DeviceSwVersion() : Brx::Empty());
     return new ConfigAppPlayerLinn(*iInfoLogger, iMediaPlayer->Env(), iMediaPlayer->Product(),
                                    iMediaPlayer->ConfigManager(), resourceHandlerFactory, aSources,
                                    Brn("Softplayer"), aResourceDir,
                                    aMinWebUiResourceThreads, aMaxWebUiTabs, aMaxSendQueueSize,
                                    aMsgBufCount, aMsgBufBytes, iRebootHandler,
-                                   linnAmpModel, linnAmpSerial,
+                                   linnAmpModel, linnAmpSerial, linnAmpHwVersion, linnAmpSwVersion,
                                    iLinnAmpVolume != nullptr);
 }
 
@@ -741,12 +899,12 @@ void TestMediaPlayer::PowerUp()
     //  - registering with IPowerManager in Run() call
     //iDevice->SetEnabled();
     //iDeviceUpnpAv->SetEnabled();
-    Log::Print("TestMediaPlayer::PowerUp\n");
+    OhLog::Print("TestMediaPlayer::PowerUp\n");
 }
 
 void TestMediaPlayer::StandbyEnabled()
 {
-    Log::Print("TestMediaPlayer::StandbyEnabled\n");
+    OhLog::Print("TestMediaPlayer::StandbyEnabled\n");
     if (iLinnAmpVolume != nullptr) {
         iLinnAmpVolume->SetStandby(true);
     }
@@ -758,7 +916,7 @@ void TestMediaPlayer::StandbyTransitioning()
 
 void TestMediaPlayer::StandbyDisabled(StandbyDisableReason /*aReason*/)
 {
-    Log::Print("TestMediaPlayer::StandbyDisabled\n");
+    OhLog::Print("TestMediaPlayer::StandbyDisabled\n");
     if (iLinnAmpVolume != nullptr) {
         iLinnAmpVolume->SetStandby(false);
     }
@@ -766,7 +924,7 @@ void TestMediaPlayer::StandbyDisabled(StandbyDisableReason /*aReason*/)
 
 void TestMediaPlayer::PowerDown()
 {
-    Log::Print("TestMediaPlayer::PowerDown\n");
+    OhLog::Print("TestMediaPlayer::PowerDown\n");
     PowerDownDisable(*iDevice);
     PowerDownDisable(*iDeviceUpnpAv);
 }
@@ -900,15 +1058,30 @@ OpenHome::Net::Library* TestMediaPlayerInit::CreateLibrary(
         initParams->SetUseLoopbackNetworkAdapter();
     }
     initParams->SetDvUpnpServerPort(51000);
+    // More UPnP session threads: the default (4) is easily starved when a
+    // control point browses the Radio Browser media server (its Browse/Search
+    // handlers do synchronous API calls taking seconds) while the renderer
+    // and web ui share the same session pool. 12 threads leave ample room.
+    initParams->SetDvNumServerThreads(12);
+    // Symbolise crash stacks in the log: ohNet prints raw module+0xoffset
+    // addresses; the handler pipes them through addr2line so the log shows
+    // thread/function/file:line directly (no manual address copying).
+    initParams->SetFatalErrorHandler(MakeFunctorMsg(CrashSymboliser::Instance(), &CrashSymboliser::FatalErrorHandler));
     initParams->SetEnableShell(aShellPort);
     initParams->SetIPv6Supported(false);
 #ifdef LPEC_ENABLE
     initParams->SetDvNumLpecThreads(4);
     initParams->SetDvLpecServerPort(2324);
 #endif
-    Debug::SetLevel(Debug::kPipeline);
+    // Debug log levels. kSources logs track/artist display updates.
+    // kMedia and kPipeline are disabled: they are extremely verbose
+    // (every HLS segment fetch / pipeline element transition is logged)
+    // and were only useful during bring-up.
+    // AddLevel (not SetLevel) so the ohPlayer application level enabled in
+    // main() (OhLog::kLevel = kApplication0) is preserved.
     Debug::AddLevel(Debug::kSources);
-    Debug::AddLevel(Debug::kMedia);
+    //Debug::AddLevel(Debug::kPipeline);
+    //Debug::AddLevel(Debug::kMedia);
     Debug::AddLevel(Debug::kRaat);
     Debug::AddLevel(Debug::kAdapterChange);
     //Debug::AddLevel(Debug::kSongcast);
@@ -919,7 +1092,7 @@ OpenHome::Net::Library* TestMediaPlayerInit::CreateLibrary(
     std::vector<NetworkAdapter*>* subnetList = lib->CreateSubnetList();
     const TUint adapterIndex = aAdapter;
     if (subnetList->size() <= adapterIndex) {
-        Log::Print("ERROR: adapter %u doesn't exist\n", adapterIndex);
+        OhLog::PrintError("TestMediaPlayer: adapter %u doesn't exist\n", adapterIndex);
         ASSERTS();
     }
     Log::Print ("adapter list:\n");
@@ -936,26 +1109,26 @@ OpenHome::Net::Library* TestMediaPlayerInit::CreateLibrary(
 
     Bws<TIpAddressUtils::kMaxAddressBytes> addressBuf;
     TIpAddressUtils::ToString(subnet, addressBuf);
-    Log::Print("using subnet %.*s\n", PBUF(addressBuf));
+    OhLog::Print("using subnet %.*s\n", PBUF(addressBuf));
     return lib;
 }
 
 void TestMediaPlayerInit::SeedRandomNumberGenerator(Environment& aEnv, const Brx& aRoom, TIpAddress aAddress, DviServerUpnp& aServer)
 {
     if (aRoom == Brx::Empty()) {
-        Log::Print("ERROR: room must be set\n");
+        OhLog::PrintError("TestMediaPlayer: room must be set\n");
         ASSERTS();
     }
     // Re-seed random number generator with hash of (unique) room name + UPnP
     // device server port to avoid UDN clashes.
     TUint port = aServer.Port(aAddress);
-    Log::Print("UPnP DV server using port: %u\n", port);
+    OhLog::Print("UPnP DV server using port: %u\n", port);
     TUint hash = 0;
     for (TUint i=0; i<aRoom.Bytes(); i++) {
         hash += aRoom[i];
     }
     hash += port;
-    Log::Print("Seeding random number generator with: %u\n", hash);
+    OhLog::Print("Seeding random number generator with: %u\n", hash);
     aEnv.SetRandomSeed(hash);
 }
 
@@ -974,4 +1147,43 @@ void TestMediaPlayerInit::AppendUniqueId(Environment& aEnv, const Brx& aUserUdn,
         }
         aOutput.Replace(aUserUdn);
     }
+}
+
+void TestMediaPlayerInit::CreateCanonicalUuid(const Brx& aSeed, Bwh& aUuid)
+{
+    static const TUint kUuidBytes = 36;
+    if (aUuid.MaxBytes() < kUuidBytes) {
+        aUuid.Grow(kUuidBytes + 1);
+    }
+    // Deterministic 128-bit hash of the seed (FNV-1a x2, two independent
+    // constants) so the same room always yields the same uuid.
+    TUint64 h1 = 0xcbf29ce484222325ULL;
+    TUint64 h2 = 0x9e3779b97f4a7c15ULL;
+    for (TUint i = 0; i < aSeed.Bytes(); i++) {
+        h1 ^= aSeed[i]; h1 *= 0x100000001b3ULL;
+        h2 ^= (TUint64(aSeed[i]) << 32) | aSeed[i]; h2 *= 0x100000001b3ULL;
+    }
+    const TUint64 ms[] = { h1, h2 };
+    const TByte* p = reinterpret_cast<const TByte*>(ms);
+    // Canonical uuid layout: 8-4-4-4-12 hex. Use "4c494e4e" ("LINN") as the
+    // first group so Linn tools recognise the device (same trick as the
+    // historical TestMediaPlayer-0123456789 udn prefix).
+    aUuid.Replace(Brn("4c494e4e"));
+    aUuid.Append('-');
+    for (TUint i = 0; i < 2; i++) { // group 2 (4 hex)
+        Ascii::AppendHex(aUuid, p[i]);
+    }
+    aUuid.Append('-');
+    for (TUint i = 2; i < 4; i++) { // group 3 (4 hex)
+        Ascii::AppendHex(aUuid, p[i]);
+    }
+    aUuid.Append('-');
+    for (TUint i = 4; i < 6; i++) { // group 4 (4 hex)
+        Ascii::AppendHex(aUuid, p[i]);
+    }
+    aUuid.Append('-');
+    for (TUint i = 6; i < 12; i++) { // group 5 (12 hex)
+        Ascii::AppendHex(aUuid, p[i]);
+    }
+    aUuid.PtrZ();
 }

@@ -97,6 +97,9 @@ ViewModel = function(){
                 { key:"Source.StartupName", helptext:"Helptext.Device.StartupSource", title:"Startup Source", type:"choice" },
                 { key:"Kustom.AutoStandby", helptext:"Helptext.Kustom.AutoStandby", title:"Auto Standby" },
                 { key:"Delay.Value", helptext:"Helptext.Delay.Value", title:"Delay (ms)" },
+                { key:"Pipeline.StarvationRamperMinSize", helptext:"Helptext.Pipeline.StarvationRamperMinSize", title:"Starvation Ramper Min Size (jiffies)", type:"numeric" },
+                { key:"Pipeline.EncodedReservoirSize", helptext:"Helptext.Pipeline.EncodedReservoirSize", title:"Encoded Reservoir Size (bytes)", type:"numeric" },
+                { key:"Pipeline.AlsaBufferUs", helptext:"Helptext.Pipeline.AlsaBufferUs", title:"Driver ALSA Buffer (us)", type:"numeric" },
                 { key:"Device.VerboseDeviceLogging", helptext:"Helptext.Device.VerboseDeviceLogging", title:"Verbose Device Logging" },
                 { key:"Analogue.Exakt.Dual.Fronts", helptext:"Helptext.Analogue.Exakt.Dual.Fronts", title:"Dual Analogue/Exakt Stereo Output"},
                 { key:"Xlr.0.Out", helptext:"Helptext.Device.XlrOutput", title:"XLR Output" },
@@ -150,9 +153,20 @@ ViewModel = function(){
                 ]);
             }
             if (src == "Radio") {
-                fieldList = fieldList.concat([
-                    { key:"Radio.TuneInUserName", helptext:"Helptext.Radio.TuneInUserName", title:"TuneIn Username", type:"combo" }
-                ]);
+                var numPresets = 18; // keep in sync with RadioPresetsStatic::kNumPresets
+                var presetFields = [];
+                presetFields.push({ key:"Radio.TuneInUserName", helptext:"Helptext.Radio.TuneInUserName", title:"TuneIn Username", type:"combo" });
+                for (var p = 1; p <= numPresets; p++) {
+                    var titles = { Name:"Name", Uri:"URL", Image:"Image URL" };
+                    var suffixes = ["Name", "Uri", "Image"];
+                    for (var si = 0; si < suffixes.length; si++) {
+                        var suffix = suffixes[si];
+                        presetFields.push({ key:"Radio.Preset" + p + "." + suffix, helptext:"Helptext.Radio.Preset." + suffix, title:"Preset " + p + " " + titles[suffix] });
+                        // compiled-in default for the reset button; hidden field, used for lookup only
+                        presetFields.push({ key:"Radio.Preset" + p + ".Default." + suffix, hidden:true });
+                    }
+                }
+                fieldList = fieldList.concat(presetFields);
             }
             if (src == "Spotify") {
                 fieldList = fieldList.concat([
@@ -246,8 +260,11 @@ ViewModel = function(){
                 { key:"LinnAmp.Bass", helptext:"Helptext.LinnAmp.Bass", title:"Bass", type:"numeric" },
                 { key:"LinnAmp.Treble", helptext:"Helptext.LinnAmp.Treble", title:"Treble", type:"numeric" },
                 { key:"LinnAmp.AlsaVolume", helptext:"Helptext.LinnAmp.AlsaVolume", title:"ALSA Volume", type:"numeric" },
+                { key:"LinnAmp.Source", helptext:"Helptext.LinnAmp.Source", title:"Amplifier Input", type:"numeric" },
                 { key:"LinnAmp.Model", helptext:"Helptext.LinnAmp.Model", title:"Detected Amplifier" },
                 { key:"LinnAmp.Serial", helptext:"Helptext.LinnAmp.Serial", title:"Amplifier Serial" },
+                { key:"LinnAmp.HwVersion", helptext:"Helptext.LinnAmp.HwVersion", title:"Amplifier HW Version" },
+                { key:"LinnAmp.SwVersion", helptext:"Helptext.LinnAmp.SwVersion", title:"Amplifier SW Version" },
             ]
         },
         {
@@ -611,19 +628,28 @@ ViewModel = function(){
             description : "Serial port the Linn amplifier is connected to (e.g. /dev/ttyUSB0). The amplifier is only used when Internal Volume Control is set to No. Changing this requires a reboot."
         },
         "Helptext.LinnAmp.Model" : {
-            description : "Model of the detected Linn amplifier."
+            description : "Model of the detected Linn amplifier, from <span class='HelpTextOption'>$ID ?$</span> (e.g. <span class='HelpTextOption'>LR2</span> for a preamplifier, <span class='HelpTextOption'>MAJIK_I</span> for a Majik integrated amplifier)."
         },
         "Helptext.LinnAmp.Bass" : {
-            description : "Bass adjustment of the Linn amplifier, from -7 to +7. Changing this requires a reboot."
+            description : "Bass adjustment of the Linn amplifier, from -7 to +7. Only supported by LR2 preamplifiers; ignored by Majik amplifiers. Changing this requires a reboot."
         },
         "Helptext.LinnAmp.Treble" : {
-            description : "Treble adjustment of the Linn amplifier, from -7 to +7. Changing this requires a reboot."
+            description : "Treble adjustment of the Linn amplifier, from -7 to +7. Only supported by LR2 preamplifiers; ignored by Majik amplifiers. Changing this requires a reboot."
         },
         "Helptext.LinnAmp.AlsaVolume" : {
             description : "ALSA output level (0-100) applied when the Linn amplifier controls the volume (Internal Volume Control set to No). Use this to match the loudness of a room driven by the Linn amplifier with a room driven by the ALSA mixer. Changing this requires a reboot."
         },
+        "Helptext.LinnAmp.Source" : {
+            description : "Input of the Linn amplifier the renderer is connected to, from 1 to 6 (Majik: <span class='HelpTextOption'>INPUT AUDIO INPUTn</span>, LR2 preamplifiers: <span class='HelpTextOption'>LISTEN n</span>). Selected at startup. Changing this requires a reboot."
+        },
         "Helptext.LinnAmp.Serial" : {
-            description : "Serial number of the detected Linn amplifier."
+            description : "Serial number of the detected Linn amplifier. Only LR2 preamplifiers report one; Majik amplifiers return their model name in <span class='HelpTextOption'>$ID ?$</span> and this field stays empty."
+        },
+        "Helptext.LinnAmp.HwVersion" : {
+            description : "Hardware version of the detected Linn amplifier, from <span class='HelpTextOption'>$VERSION HARDWARE ?$</span>."
+        },
+        "Helptext.LinnAmp.SwVersion" : {
+            description : "Software version of the detected Linn amplifier, from <span class='HelpTextOption'>$VERSION SOFTWARE ?$</span>."
         },
         "Helptext.Sender.Enabled" : {
             description : "If you wish to allow other Songcast receivers in your home to listen to the <%- device %> select <span class='HelpTextOption'><%- field.meta.options[1].value %></span>. Otherwise select <span class='HelpTextOption'><%- field.meta.options[0].value %></span>.",
@@ -638,6 +664,21 @@ ViewModel = function(){
             description : "If you wish the <%- device %> (Songcast sender) to be selectable as a numeric preset from the handset, set the preset number.",
             options : "0 (Disabled), 1 to 9999 (Enabled)",
             "default" : "0 (Disabled)"
+        },
+        "Helptext.Pipeline.StarvationRamperMinSize" : {
+            description : "Advanced: minimum amount of buffered decoded audio, in jiffies (56448 per ms), in the downstream reservoir. Together with the Driver ALSA Buffer it forms the downstream latency. The Songcast protocol aligns a receiver on the media latency announced by the sender: the pipeline can compensate downstream buffers up to that target but cannot recover an overshoot. Keep Starvation Ramper Min Size + Driver ALSA Buffer below the sender's target (150 ms from a Linn DS sender, 300 ms from an ohPlayer sender); a warning is logged when the configured sum exceeds the target observed in the live stream. Increase this value if you experience audio dropouts on unstable network links (e.g. powerline). Default: 5644800 (100 ms). Changing this requires a reboot.",
+            options : "<%- field.meta.min %> (min) to <%- field.meta.max %> (max) jiffies (56448 per ms)",
+            "default" : "5644800 (100 ms)"
+        },
+        "Helptext.Pipeline.AlsaBufferUs" : {
+            description : "Advanced: ALSA hardware buffer of the audio driver, in microseconds. Part of the downstream latency (together with the Starvation Ramper Min Size) - keep the sum below the Songcast sender's target (150 ms from a Linn DS sender, 300 ms from an ohPlayer sender); a warning is logged when the configured sum exceeds the target observed in the live stream. A smaller buffer reduces multiroom offset but increases the risk of xruns (audio glitches) under CPU load. Default: 12052 us (12 ms). Changing this requires a reboot.",
+            options : "<%- field.meta.min %> (min) to <%- field.meta.max %> (max) microseconds",
+            "default" : "12052 (12 ms)"
+        },
+        "Helptext.Pipeline.EncodedReservoirSize" : {
+            description : "Advanced: size, in bytes, of the buffer between the network and the decoder. Note: this buffer only fills for sources that deliver faster than real time (e.g. http radio bursts); a Songcast stream is paced at real time and keeps it near empty, so increasing it does not protect against Songcast dropouts - the Starvation Ramper and the decoded reservoir are what absorb network cuts there. Default: 1572864 (1536 KB, the ohPipeline default). Changing this requires a reboot.",
+            options : "<%- field.meta.min %> (min) to <%- field.meta.max %> (max) bytes",
+            "default" : "1572864 (1536 KB)"
         },
         "Helptext.StreamingService.Enabled" : {
             description : "Enables the <%- field.helptextparams.service %> service on your <%- device %>. Go to <a href='<%- field.helptextparams.servicelinkuri %>' target='_blank'><%- field.helptextparams.servicelinktitle %></a> for more information."
@@ -655,6 +696,15 @@ ViewModel = function(){
         },
         "Helptext.Radio.TuneInUserName" : {
             description: "Enter your TuneIn account username for accessing your stored radio presets. Go to <a href='http://TuneIn.com/' target='_blank'>TuneIn.com</a> to setup your account. You may also select from the drop down list of Pre-defined accounts.",
+        },
+        "Helptext.Radio.Preset.Name" : {
+            description: "Name of the station stored in this radio preset, shown in control point apps. Leave empty to unset the preset.",
+        },
+        "Helptext.Radio.Preset.Uri" : {
+            description: "URL of the audio stream (e.g. https://icecast.radiofrance.fr/franceinter-hifi.aac) for this radio preset. Leave empty to unset the preset.",
+        },
+        "Helptext.Radio.Preset.Image" : {
+            description: "Optional URL of the station logo (e.g. https://commons.wikimedia.org/wiki/Special:FilePath/FIP_logo_2021.svg?width=250) shown as artwork in control point apps.",
         },
         "Helptext.Volume.Enabled" : {
             description : "If you wish to use the <%- device %> with an external pre amplifier, select <span class='HelpTextOption'><%- field.meta.options[1].value %></span>. Otherwise select <span class='HelpTextOption'><%- field.meta.options[0].value %></span>" +
