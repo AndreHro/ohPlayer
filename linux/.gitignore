@@ -9,10 +9,22 @@ tags
 # Object files created during the build process.
 objs/
 debug-objs/
+*.o
+*.a
+*.so
 
-# Executables
+# Executables & platform build output
 openhome-player
+linux/raspbian/
 
 # Generated install packages
 *.deb
 *.sh
+!fetch_deps.sh
+
+# Downloaded external dependencies
+dependencies/
+kfr/
+
+# Local room-correction impulse responses
+*.wav

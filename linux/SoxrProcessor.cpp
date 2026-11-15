@@ -423,3 +423,4 @@ void SoxrPcmProcessor::ProcessSilence(
 
     ProcessFragment(silenceData, aNumChannels, aSubsampleBytes);
 }
+

@@ -1,5 +1,5 @@
 #include "DriverAlsa.h"
-#include "SoxrProcessor.h"
+#include "KfrPcmProcessor.h"
 #include "IDataSink.h"
 #include "ConvertBELE.h"
 #include "OhLog.h"
@@ -7,7 +7,11 @@
 #include <alsa/asoundlib.h>
 #include <memory>
 #include <atomic>
+#include <algorithm>
 #include <cerrno> 
+#include <cstdint>
+#include <limits>
+#include <string>
 
 
 using namespace OpenHome;
@@ -102,17 +106,21 @@ IPcmProcessor& Profile::GetPcmProcessor() const
 class DriverAlsaPimpl final : public IDriverBackend, public IDataSink
 {
 public:
-    DriverAlsaPimpl(const Brx& aAlsaDevice, TUint aBufferUs, TUint aOutputSampleRate);
+    DriverAlsaPimpl(const Brx& aAlsaDevice, 
+        TUint aBufferUs, TUint aOutputSampleRate,
+        const Brx& aKfrIrConfigDir);
     virtual ~DriverAlsaPimpl();
     void ProcessDecodedStream(MsgDecodedStream* aMsg) override;
     void ProcessPlayable(MsgPlayable* aMsg) override;
     void ProcessDrain() override;
-    void ProcessMode() override;
+    void ProcessMode(const Brx& aMode) override;
     void LogPCMState();
     TUint DriverDelayJiffies(TUint aSampleRate) override;
 public:
     void Write(const Brx& aData) override;
+#if 0    
     void WritePcmDirect(const Brx& aData, TUint aNumChannels, TUint aSubsampleBytes);
+#endif
 private:
     TBool TryProfile(Profile& aProfile, TUint aBitDepth, TUint aNumChannels,
                      TUint aSampleRate, TUint aBufferUs);
@@ -128,9 +136,11 @@ private:
     TUint iRecoverCount;
     TUint iWaitCount;
     TUint iBufferUs;
+    std::string iKfrIrConfigDir;
 
     TUint iOutputSampleRate;
     std::atomic<TUint> iCurrentOutputRate{0};
+    TBool iLowLatencyMode{false};
 
     std::vector<TInt32> iTmpOut;
     std::vector<TByte>  iS32ConversionBuffer;
@@ -138,7 +148,11 @@ private:
     static const TUint kSampleBufSize = 16 * 1024;
 };
 
-DriverAlsaPimpl::DriverAlsaPimpl(const Brx& aAlsaDevice, TUint aBufferUs, TUint aOutputSampleRate)
+DriverAlsaPimpl::DriverAlsaPimpl(
+    const Brx& aAlsaDevice,
+    TUint aBufferUs,
+    TUint aOutputSampleRate,
+    const Brx& aKfrIrConfigDir)
 : iHandle(nullptr)
 , iSampleBuffer(kSampleBufSize)
 , iSampleBytes(0)
@@ -150,6 +164,9 @@ DriverAlsaPimpl::DriverAlsaPimpl(const Brx& aAlsaDevice, TUint aBufferUs, TUint 
 , iRecoverCount(0)
 , iWaitCount(0)
 , iBufferUs(aBufferUs)
+, iKfrIrConfigDir(aKfrIrConfigDir.Bytes() == 0
+    ? std::string()
+    : std::string(reinterpret_cast<const char*>(aKfrIrConfigDir.Ptr()), aKfrIrConfigDir.Bytes()))
 , iOutputSampleRate(aOutputSampleRate)
 , iCurrentOutputRate(aOutputSampleRate)
 {
@@ -159,7 +176,7 @@ DriverAlsaPimpl::DriverAlsaPimpl(const Brx& aAlsaDevice, TUint aBufferUs, TUint 
 
     if (err < 0) {
         OhLog::PrintError(
-            "DriverAlsa: snd_pcm_open() failed: %s\n", snd_strerror(err));
+            "DriverAlsa: snd_pcm_open() failed: %s\n", std::string(snd_strerror(err)).c_str());
         iHandle = nullptr;
         iDitch = true;
         return;
@@ -171,7 +188,8 @@ DriverAlsaPimpl::DriverAlsaPimpl(const Brx& aAlsaDevice, TUint aBufferUs, TUint 
     initialSpec.iInputRate = 44100.0;
     initialSpec.iOutputRate = aOutputSampleRate != 0 ? aOutputSampleRate : 44100.0;
 
-    auto pcmProcessor = std::make_unique<SoxrPcmProcessor>(*this, iSampleBuffer, initialSpec);
+    auto pcmProcessor = std::make_unique<KfrPcmProcessor>(
+        *this, iSampleBuffer, initialSpec, iKfrIrConfigDir);
     iProfile = std::make_unique<Profile>(
         std::move(pcmProcessor),
         OutputFormat(SND_PCM_FORMAT_S32_LE, 4),
@@ -206,18 +224,43 @@ void DriverAlsaPimpl::ProcessDrain()
     // Flush the resampler before ALSA is drained.
     iProfile->GetPcmProcessor().Flush();
 
+    snd_pcm_state_t state = snd_pcm_state(iHandle);
+    if (state == SND_PCM_STATE_XRUN) {
+        const int recoverError = snd_pcm_recover(iHandle, -EPIPE, 1);
+        if (recoverError < 0) {
+            OhLog::PrintError("DriverAlsa: XRUN recovery failed: %s\n",
+                              std::string(snd_strerror(recoverError)).c_str());
+        }
+        return;
+    }
+    if (state != SND_PCM_STATE_RUNNING && state != SND_PCM_STATE_DRAINING) {
+        return;
+    }
+
     auto err = snd_pcm_drain(iHandle);
     if (err < 0) {
-        OhLog::PrintError("DriverAlsa: snd_pcm_drain() error: %s\n",
-                          snd_strerror(err));
-        snd_pcm_drop(iHandle);
+        state = snd_pcm_state(iHandle);
+        OhLog::PrintError("DriverAlsa: snd_pcm_drain() error: %s (state=%d)\n",
+                          std::string(snd_strerror(err)).c_str(), state);
+        const int recoverError = snd_pcm_recover(iHandle, err, 1);
+        if (recoverError < 0) {
+            OhLog::PrintError("DriverAlsa: drain recovery failed: %s (state=%d)\n",
+                              std::string(snd_strerror(recoverError)).c_str(),
+                              snd_pcm_state(iHandle));
+        }
+        return;
     }
 
     err = snd_pcm_prepare(iHandle);
     if (err < 0) {
         OhLog::PrintError("DriverAlsa: snd_pcm_prepare() error: %s\n",
-                          snd_strerror(err));
-        snd_pcm_recover(iHandle, err, 1);
+                          std::string(snd_strerror(err)).c_str());
+        const int recoverError = snd_pcm_recover(iHandle, err, 1);
+        if (recoverError < 0) {
+            OhLog::PrintError("DriverAlsa: prepare recovery failed: %s (state=%d)\n",
+                              std::string(snd_strerror(recoverError)).c_str(),
+                              snd_pcm_state(iHandle));
+        }
     }
 }
 
@@ -266,7 +309,7 @@ void DriverAlsaPimpl::Write(const Brx& aData)
             // Attempt to restore the hardware state
             const int err = snd_pcm_recover(iHandle, framesWritten, 1);
             if (err < 0) {
-                OhLog::PrintError("DriverAlsa: snd_pcm_recover failed: %s\n", snd_strerror(err));
+                OhLog::PrintError("DriverAlsa: snd_pcm_recover failed: %s\n", std::string(snd_strerror(err)).c_str());
                 return; // Break out immediately to protect the pipeline thread
             }
 
@@ -289,7 +332,7 @@ void DriverAlsaPimpl::Write(const Brx& aData)
             if (err < 0) {
                 OhLog::PrintError(
                     "DriverAlsa: snd_pcm_wait() error: %s\n",
-                    snd_strerror(err));
+                    std::string(snd_strerror(err)).c_str());
                 return;
             }
 
@@ -319,7 +362,7 @@ void DriverAlsaPimpl::Write(const Brx& aData)
         retryTimeouts = 0;
     }
 }
-
+#if 0
 void DriverAlsaPimpl::WritePcmDirect(const Brx& aData, TUint aNumChannels, TUint aSubsampleBytes)
 {
     if (iSampleBytes == 0) {
@@ -355,6 +398,7 @@ void DriverAlsaPimpl::WritePcmDirect(const Brx& aData, TUint aNumChannels, TUint
     const Brn converted(iS32ConversionBuffer.data(), outputBytes);
     Write(converted);
 }
+#endif
 
 #ifdef DEBUG
 void DriverAlsaPimpl::LogPCMState()
@@ -454,13 +498,14 @@ void DriverAlsaPimpl::ProcessDecodedStream(MsgDecodedStream* aMsg)
         return;
     }
 
-    SoxrPcmProcessor& pcmProcessor =
-        static_cast<SoxrPcmProcessor&>(iProfile->GetPcmProcessor());
+    KfrPcmProcessor& pcmProcessor =
+        static_cast<KfrPcmProcessor&>(iProfile->GetPcmProcessor());
     AudioSpec spec{};
     spec.iNumChannels = decodedStreamInfo.NumChannels();
     spec.iBitDepth = bitDepth;
     spec.iInputRate = decodedStreamInfo.SampleRate();
     spec.iOutputRate = outputRate;
+    spec.iLowLatency = iLowLatencyMode;
 
     pcmProcessor.SetDuplicateChannel(iDuplicateChannel);
     pcmProcessor.UpdateFormatSpec(spec);
@@ -494,23 +539,34 @@ TBool DriverAlsaPimpl::TryProfile(Profile& aProfile,
     snd_pcm_hw_params_alloca(&hwParams);
     snd_pcm_sw_params_alloca(&swParams);
 
-    // Only call snd_pcm_hw_free if the device has already been configured.
-    // Calling it in SND_PCM_STATE_OPEN returns -EBADFD and causes setup to fail.
+    auto fail = [](const char* aOperation, int aError) -> TBool {
+        Log::Print("DriverAlsa: %s failed: %s (%d)\n",
+                   aOperation, snd_strerror(aError), aError);
+        return false;
+    };
+
     const snd_pcm_state_t state = snd_pcm_state(iHandle);
     if (state != SND_PCM_STATE_OPEN) {
-        snd_pcm_hw_free(iHandle);
+        const int dropError = snd_pcm_drop(iHandle);
+        if (dropError < 0 && dropError != -EBADFD) {
+            return fail("snd_pcm_drop", dropError);
+        }
+        const int freeError = snd_pcm_hw_free(iHandle);
+        if (freeError < 0) {
+            return fail("snd_pcm_hw_free", freeError);
+        }
     }
 
     int err = snd_pcm_hw_params_any(iHandle, hwParams);
-    if (err < 0) return false;
+    if (err < 0) return fail("snd_pcm_hw_params_any", err);
 
     err = snd_pcm_hw_params_set_access(iHandle, hwParams,
                                        SND_PCM_ACCESS_RW_INTERLEAVED);
-    if (err < 0) return false;
+    if (err < 0) return fail("snd_pcm_hw_params_set_access", err);
 
     err = snd_pcm_hw_params_set_format(iHandle, hwParams,
                                        outputFormat.first);
-    if (err < 0) return false;
+    if (err < 0) return fail("snd_pcm_hw_params_set_format", err);
 
     const TUint outputChannels =
         (iDuplicateChannel && aNumChannels == 1) ? 2 : aNumChannels;
@@ -520,55 +576,71 @@ TBool DriverAlsaPimpl::TryProfile(Profile& aProfile,
         hwParams,
         outputChannels);
     if (err < 0) {
-        return false;
+        return fail("snd_pcm_hw_params_set_channels", err);
     }
 
     unsigned int rate = aSampleRate;
     err = snd_pcm_hw_params_set_rate_near(iHandle, hwParams, &rate, nullptr);
-    if (err < 0 || rate != aSampleRate) return false;
-
-    unsigned int bufferTime = aBufferUs;
-    err = snd_pcm_hw_params_set_buffer_time_near(iHandle,
-                                                 hwParams,
-                                                 &bufferTime,
-                                                 nullptr);
-    if (err < 0) return false;
-
-    unsigned int periodTime = bufferTime / 8;
-    if (periodTime < 10000) {
-        periodTime = 10000; // 10 ms minimum
+    if (err < 0) return fail("snd_pcm_hw_params_set_rate_near", err);
+    if (rate != aSampleRate) {
+        Log::Print("DriverAlsa: ALSA rate mismatch: requested=%u negotiated=%u\n",
+                   aSampleRate, rate);
+        return false;
     }
 
-    err = snd_pcm_hw_params_set_period_time_near(iHandle,
+    const uint64_t requestedBufferFrames =
+        (static_cast<uint64_t>(aBufferUs) * aSampleRate + 999999) / 1000000;
+    const snd_pcm_uframes_t minimumBufferFrames = iLowLatencyMode ? 4096 : 8192;
+    snd_pcm_uframes_t bufferSize = iLowLatencyMode
+        ? minimumBufferFrames
+        : std::max<snd_pcm_uframes_t>(
+              minimumBufferFrames,
+              static_cast<snd_pcm_uframes_t>(requestedBufferFrames));
+    snd_pcm_uframes_t periodSize = 1024;
+    err = snd_pcm_hw_params_set_period_size_near(iHandle,
                                                  hwParams,
-                                                 &periodTime,
+                                                 &periodSize,
                                                  nullptr);
-    if (err < 0) return false;
+    if (err < 0) return fail("snd_pcm_hw_params_set_period_size_near", err);
+
+    err = snd_pcm_hw_params_set_buffer_size_near(iHandle,
+                                                 hwParams,
+                                                 &bufferSize);
+    if (err < 0) return fail("snd_pcm_hw_params_set_buffer_size_near", err);
+    if (bufferSize < minimumBufferFrames) {
+        Log::Print("DriverAlsa: ALSA buffer below required minimum: %lu frames\n",
+                   bufferSize);
+        return false;
+    }
 
     err = snd_pcm_hw_params(iHandle, hwParams);
-    if (err < 0) return false;
+    if (err < 0) return fail("snd_pcm_hw_params", err);
 
-    snd_pcm_uframes_t bufferSize = 0;
-    snd_pcm_uframes_t periodSize = 0;
-
-    snd_pcm_hw_params_get_buffer_size(hwParams, &bufferSize);
-    snd_pcm_hw_params_get_period_size(hwParams, &periodSize, nullptr);
+    err = snd_pcm_hw_params_get_buffer_size(hwParams, &bufferSize);
+    if (err < 0) return fail("snd_pcm_hw_params_get_buffer_size", err);
+    if (bufferSize < minimumBufferFrames) {
+        Log::Print("DriverAlsa: configured ALSA buffer below required minimum: %lu frames\n",
+                   bufferSize);
+        return false;
+    }
+    err = snd_pcm_hw_params_get_period_size(hwParams, &periodSize, nullptr);
+    if (err < 0) return fail("snd_pcm_hw_params_get_period_size", err);
 
     err = snd_pcm_sw_params_current(iHandle, swParams);
-    if (err < 0) return false;
+    if (err < 0) return fail("snd_pcm_sw_params_current", err);
 
     err = snd_pcm_sw_params_set_start_threshold(iHandle,
                                                 swParams,
-                                                periodSize);
-    if (err < 0) return false;
+                                                bufferSize / 2);
+    if (err < 0) return fail("snd_pcm_sw_params_set_start_threshold", err);
 
     err = snd_pcm_sw_params_set_avail_min(iHandle,
                                           swParams,
                                           periodSize);
-    if (err < 0) return false;
+    if (err < 0) return fail("snd_pcm_sw_params_set_avail_min", err);
 
     err = snd_pcm_sw_params(iHandle, swParams);
-    if (err < 0) return false;
+    if (err < 0) return fail("snd_pcm_sw_params", err);
 
     snd_pcm_uframes_t startThreshold = 0;
     snd_pcm_uframes_t availMin = 0;
@@ -576,27 +648,31 @@ TBool DriverAlsaPimpl::TryProfile(Profile& aProfile,
     snd_pcm_sw_params_get_avail_min(swParams, &availMin);
 
     err = snd_pcm_prepare(iHandle);
-    if (err < 0) return false;
+    if (err < 0) return fail("snd_pcm_prepare", err);
 
-    Log::Print("DriverAlsa: configured ALSA: rate=%u channels=%u "
-           "format=%d buffer=%lu frames period=%lu frames\n",
+        Log::Print("DriverAlsa: configured ALSA: rate=%u channels=%u "
+            "format=%d buffer=%lu frames period=%lu frames lowLatency=%u\n",
            rate,
            outputChannels,
            outputFormat.first,
            bufferSize,
-           periodSize);
+            periodSize,
+            iLowLatencyMode);
 
     return true;
 }
 
 TUint DriverAlsaPimpl::DriverDelayJiffies(TUint aSampleRate)
 {
+    const TUint dspDelay = iProfile == nullptr
+        ? 0
+        : static_cast<KfrPcmProcessor&>(iProfile->GetPcmProcessor()).GetDelayJiffies();
     const TUint rate = iCurrentOutputRate.load() != 0
         ? iCurrentOutputRate.load()
         : aSampleRate;
 
     if (iHandle == nullptr || !aSampleRate) {
-        return 0;
+        return dspDelay;
     }
 
     snd_pcm_sframes_t delayFrames = 0;
@@ -605,20 +681,25 @@ TUint DriverAlsaPimpl::DriverDelayJiffies(TUint aSampleRate)
     if (ret < 0) {
         // Do not call snd_pcm_recover here: DriverDelayJiffies is called
         // from the pipeline animator thread and can race with AudioThread writes.
-        return 0;
+        return dspDelay;
     }
 
     if (delayFrames < 0) {
         delayFrames = 0;
     }
 
-    return (TUint)delayFrames * Jiffies::PerSample(rate);
+    const uint64_t totalDelay = static_cast<uint64_t>(delayFrames) *
+                                Jiffies::PerSample(rate) + dspDelay;
+    return static_cast<TUint>(std::min<uint64_t>(
+        totalDelay, std::numeric_limits<TUint>::max()));
 }
 
-void DriverAlsaPimpl::ProcessMode()
+void DriverAlsaPimpl::ProcessMode(const Brx& aMode)
 {
+    iLowLatencyMode = aMode == Brn("ALSA_CAPTURE");
     OhLog::Print(
-        "DriverAlsa: MsgMode intercepted. Purging pipeline tracking state.\n");
+        "DriverAlsa: MsgMode intercepted. lowLatency=%u; purging pipeline tracking state.\n",
+        iLowLatencyMode);
 
     if (iProfile != nullptr) {
         iProfile->GetPcmProcessor().Flush();
@@ -629,12 +710,24 @@ void DriverAlsaPimpl::ProcessMode()
     iBytesSent = 0;
 }
 
-DriverAlsa::DriverAlsa(IPipeline& aPipeline, const Brx& aAlsaDevice, TUint aBufferUs, TUint aOutputSampleRate)
-: PipelineDriverBase(aPipeline, std::make_unique<DriverAlsaPimpl>(aAlsaDevice, aBufferUs, aOutputSampleRate))
-{}
+DriverAlsa::DriverAlsa(IPipeline& aPipeline,
+                       const Brx& aAlsaDevice,
+                       TUint aBufferUs,
+                       TUint aOutputSampleRate,
+                       bool aDisableUpsample,
+                       const Brx& aKfrIrConfigDir)
+: PipelineDriverBase(aPipeline, std::make_unique<DriverAlsaPimpl>(
+      aAlsaDevice, aBufferUs, aOutputSampleRate, aKfrIrConfigDir))
+{
+    (void)aDisableUpsample;
+}
 
-DriverAlsa::DriverAlsa(IPipeline& aPipeline, TUint aBufferUs, TUint aOutputSampleRate)
-: DriverAlsa(aPipeline, Brn("default"), aBufferUs, aOutputSampleRate)
+DriverAlsa::DriverAlsa(IPipeline& aPipeline,
+                       TUint aBufferUs,
+                       TUint aOutputSampleRate,
+                       const Brx& aKfrIrConfigDir)
+: DriverAlsa(aPipeline, Brn("default"), aBufferUs, aOutputSampleRate,
+             false, aKfrIrConfigDir)
 {}
 
 PipelineDriverBase::PipelineDriverBase(
@@ -749,7 +842,7 @@ Msg* PipelineDriverBase::ProcessMsg(MsgMode* aMsg)
     Brhz modeNameCStr(modeName); 
     OhLog::Print("DriverAlsa: MsgMode intercepted. %s \n", modeNameCStr.CString());
 
-    iBackend->ProcessMode();
+    iBackend->ProcessMode(aMsg->Mode());
 
     return aMsg;
 }
@@ -762,3 +855,4 @@ Msg* PipelineDriverBase::ProcessMsg(MsgDrain* aMsg)
 
     return aMsg;
 }
+

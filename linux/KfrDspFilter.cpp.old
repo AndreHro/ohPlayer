@@ -1,0 +1,75 @@
+#include "KfrDspFilter.h"
+#include <OpenHome/Private/Debug.h>
+#include <stdexcept>
+#include <dlfcn.h>
+
+namespace OpenHome {
+namespace Media {
+
+KfrDspFilter::KfrDspFilter(IPipelineElementUpstream& aUpstreamElement,
+                           const char* aSharedLibName,
+                           const char* aFilterPathOrJson)
+    : PipelineElement(MsgClass::kAudioPcm)
+    , iDspContext(nullptr, KfrContextDeleter{nullptr})
+    , iLibHandle(::dlopen(aSharedLibName, RTLD_NOW), DLCloser{})
+    , iUpstreamElement(aUpstreamElement)
+    , iProcessFunc(nullptr)
+{
+    if (!iLibHandle) {
+        throw std::runtime_error(std::string("KfrDspFilter: dlopen failed: ") + ::dlerror());
+    }
+
+    ::dlerror(); 
+    iDspContext.get_deleter().libHandle = iLibHandle.get();
+
+    typedef KfrDspContext* (*CreateFuncPtr)(const char*);
+    auto createFunc = reinterpret_cast<CreateFuncPtr>(::dlsym(iLibHandle.get(), "kfr_dsp_create"));
+    if (!createFunc) {
+        throw std::runtime_error(std::string("KfrDspFilter: Symbol kfr_dsp_create missing: ") + ::dlerror());
+    }
+
+    iProcessFunc = reinterpret_cast<ProcessFuncPtr>(::dlsym(iLibHandle.get(), "kfr_dsp_process_interleaved"));
+    if (!iProcessFunc) {
+        throw std::runtime_error(std::string("KfrDspFilter: Symbol kfr_dsp_process_interleaved missing: ") + ::dlerror());
+    }
+
+    KfrDspContext* rawContext = createFunc(aFilterPathOrJson);
+    if (!rawContext) {
+        throw std::runtime_error("KfrDspFilter: Shared library failed to allocate KfrDspContext state.");
+    }
+    iDspContext.reset(rawContext);
+}
+
+Msg* KfrDspFilter::Pull()
+{
+    Msg* msg = iUpstreamElement.Pull();
+    return msg->Process(*this);
+}
+
+Msg* KfrDspFilter::ProcessMsg(MsgAudioPcm* aMsg)
+{
+    KfrAudioType sampleType;
+    switch (aMsg->BitDepth()) {
+        case 16: sampleType = KFR_AUDIO_I16; break;
+        case 24: sampleType = KFR_AUDIO_I24; break;
+        case 32: sampleType = KFR_AUDIO_I32; break;
+        default: return aMsg; 
+    }
+
+    // FIX: Using aMsg->Samples() scales natively without division risks
+    const size_t frameCount = aMsg->Samples(); 
+    const unsigned channels = aMsg->Channels();
+    void* rawDataPtr = const_cast<void*>(reinterpret_cast<const void*>(aMsg->Ptr()));
+
+    if (iProcessFunc && iDspContext && frameCount > 0 && channels > 0) {
+        const int result = iProcessFunc(iDspContext.get(), rawDataPtr, frameCount, channels, sampleType);
+        if (result != 0) {
+            Log::Print("KfrDspFilter: Warning - Processing routine error returned: %d\n", result);
+        }
+    }
+
+    return aMsg;
+}
+
+} // namespace Media
+} // namespace OpenHome

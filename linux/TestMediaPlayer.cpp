@@ -42,6 +42,11 @@
 #include <OpenHome/Private/Debug.h>
 #include "DriverAlsa.h"
 
+#if CAPTURE_ALSA
+#include "capture/SourceAlsaCapture.h"
+#include "capture/ProtocolAlsaCapture.h"
+#endif
+
 #include <vector>
 
 #undef LPEC_ENABLE
@@ -175,7 +180,7 @@ const TUint TestMediaPlayer::kDsdPadBytesPerChunk;
 
 TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack, const Brx& aUdn, const TChar* aRoom, const TChar* aProductName,
                                  const Brx& aTuneInPartnerId, const Brx& aTidalId, const Brx& aQobuzIdSecret, const Brx& aUserAgent,
-                                 const TChar* aStoreFile, TUint aOdpPort, TUint aWebUiPort,
+                                 const TChar* aStoreFile, const Brx& aKFRConfigDir, TUint aOdpPort, TUint aWebUiPort,
                                  TUint aMinWebUiResourceThreads, TUint aMaxWebUiTabs, TUint aUiSendQueueSize,
                                  TUint aUiMsgBufCount, TUint aUiMsgBufBytes)
     : iPullableClock(nullptr)
@@ -287,22 +292,20 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
                                    volumeInit, volumeProfile,
                                    *iInfoLogger,
                                    aUdn, mpInit);
+   
     delete mpInit;
-
-    // Register Linn Amp web config parameters (volume control choice and serial port)
-    iLinnAmpConfig = std::make_unique<LinnAmpConfig>(iMediaPlayer->ConfigInitialiser());
     
     iDriver = std::make_unique<DriverAlsa>(iMediaPlayer->Pipeline(), 22052);
 #if 1
     if (iDriver == NULL)
     {
-        Log::Print("%s:%d - Unable to start DriverAlsa\n", __FILE__, __LINE__);
+        Log::Print("%s:%d - Unable to start Audio Driver\n", __FILE__, __LINE__);
     }
     else
     {
-        Log::Print("%s:%d - DriverAlsa started !\n", __FILE__, __LINE__);
+        Log::Print("%s:%d - Audio Driver started !\n", __FILE__, __LINE__);
     }
-#endif
+
     iPipelineObserver = std::make_unique<LoggingPipelineObserver>();
     iMediaPlayer->Pipeline().AddObserver(*iPipelineObserver);
     Log::Print("%s:%d\n", __FILE__, __LINE__);
@@ -548,6 +551,15 @@ void TestMediaPlayer::RegisterPlugins(Environment& aEnv)
 
         iMediaPlayer->Add(ProtocolFactory::NewTidal(ssl, clientId, clientSecret, apps, *iMediaPlayer));
     }
+# ifdef CAPTURE_ALSA
+    Media::ProtocolAlsaCapture::DevParam devParam{
+        .iDevName = Bws<64>("plughw:1,0"),
+        .iSampleRate = 48000,
+        .iChannels = 2
+    };
+    iMediaPlayer->Add(new Media::ProtocolAlsaCapture(devParam, aEnv));
+#endif
+
     // ...likewise, only add Qobuz if we have ids for login
     if (iQobuzIdSecret.Bytes() > 0) {
         Parser p(iQobuzIdSecret);
@@ -607,6 +619,11 @@ void TestMediaPlayer::RegisterPlugins(Environment& aEnv)
 #else
     iMediaPlayer->Add(SourceFactory::NewScd(*iMediaPlayer, nullptr));
 #endif
+
+#ifdef CAPTURE_ALSA
+    iMediaPlayer->Add(new AlsaCapture::SourceAlsaCapture(*iMediaPlayer));
+#endif
+
 }
 
 void TestMediaPlayer::InitialiseSubsystems()

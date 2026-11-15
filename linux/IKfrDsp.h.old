@@ -1,0 +1,31 @@
+#ifndef IKFRDSP_H
+#define IKFRDSP_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+typedef struct KfrDspContext KfrDspContext;
+
+typedef enum {
+    KFR_AUDIO_I16 = 0,
+    KFR_AUDIO_I24 = 1,
+    KFR_AUDIO_I32 = 2
+} KfrAudioType;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+KfrDspContext* kfr_dsp_create(const char* filter_path_or_json);
+void kfr_dsp_destroy(KfrDspContext* ctx);
+int kfr_dsp_process_interleaved(KfrDspContext* ctx,
+                                void* pcm_data,
+                                size_t frame_count,
+                                unsigned aNumChannels,
+                                KfrAudioType sample_type);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // IKFRDSP_H
