@@ -3,6 +3,8 @@
 #include <OpenHome/Types.h>
 #include <OpenHome/Buffer.h>
 #include "VolumeControl.h"
+#include "OhLinnAmpVolume.h"
+#include "LinnAmpConfig.h"
 
 #include <OpenHome/Av/MediaPlayer.h>
 #include <OpenHome/Net/Core/DvDevice.h>
@@ -124,7 +126,7 @@ private: // from IRaatSignalPathObservable
     void RegisterObserver(IRaatSignalPathObserver& aObserver) override;
 };
 
-class TestMediaPlayer : private Net::IResourceManager, public IPowerHandler/*, public Web::IWebAppFramework*/
+class TestMediaPlayer : private Net::IResourceManager, public IPowerHandler, public IStandbyHandler/*, public Web::IWebAppFramework*/
 {
 private:
     static const Brn kSongcastSenderIconFileName;
@@ -173,6 +175,10 @@ private: // from Net::IResourceManager
 private: // from IPowerHandler
     void PowerUp() override;
     void PowerDown() override;
+private: // from IStandbyHandler
+    void StandbyEnabled() override;
+    void StandbyTransitioning() override;
+    void StandbyDisabled(StandbyDisableReason aReason) override;
 //private: // from IWebAppFramework
 //    void Add(Web::IWebApp* aWebApp, FunctorPresentationUrl aFunctor) override;
 private:
@@ -201,6 +207,7 @@ private:
     Semaphore iSemShutdown;
     Semaphore iDisabled;
     IPowerManagerObserver* iPowerObserver;
+    IStandbyObserver* iStandbyObserver;
     const Brh iTuneInPartnerId;
     const Brh iTidalValues;
     const Brh iQobuzIdSecret;

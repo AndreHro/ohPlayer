@@ -168,6 +168,11 @@ VolumeControl::VolumeControl(TBool aDisableVolume, const TChar* aCard, const std
 VolumeControl::~VolumeControl()
 {}
 
+void VolumeControl::SetVolumeFixed(TUint aVolume)
+{
+    SetVolume(aVolume);
+}
+
 void VolumeControl::SetVolume(TUint aVolume)
 {
     if (iVolumeDisabled || !impl) return;

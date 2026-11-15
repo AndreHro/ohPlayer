@@ -132,6 +132,9 @@ private:
     std::unique_ptr<Profile> iProfile;
     TBool iDitch;
     TUint iBytesSent;
+    TUint iXrunCount;
+    TUint iRecoverCount;
+    TUint iWaitCount;
     TUint iBufferUs;
     std::string iKfrIrConfigDir;
 
@@ -157,6 +160,9 @@ DriverAlsaPimpl::DriverAlsaPimpl(
 , iProfile(nullptr)
 , iDitch(false)
 , iBytesSent(0)
+, iXrunCount(0)
+, iRecoverCount(0)
+, iWaitCount(0)
 , iBufferUs(aBufferUs)
 , iKfrIrConfigDir(aKfrIrConfigDir.Bytes() == 0
     ? std::string()
@@ -265,7 +271,16 @@ void DriverAlsaPimpl::Write(const Brx& aData)
     }
 
     if (iSampleBytes == 0) {
-        OhLog::PrintError("DriverAlsa: invalid sample size\n");
+        OhLog::PrintError("DriverAlsa: invalid sample size");
+        return;
+    }
+
+    if ((aData.Bytes() % iSampleBytes) != 0) {
+        OhLog::PrintError("DriverAlsa: PCM buffer is not frame aligned: "
+                          "bytes=%u frameBytes=%u remainder=%u",
+                          aData.Bytes(),
+                          iSampleBytes,
+                          aData.Bytes() % iSampleBytes);
         return;
     }
 
@@ -305,6 +320,10 @@ void DriverAlsaPimpl::Write(const Brx& aData)
                 return;
             }
 
+            ++iRecoverCount;
+            Log::Print("DriverAlsa: recovered from %s (recoveries=%u)",
+                       snd_strerror(writeError),
+                       iRecoverCount);
             continue;
         }
         if (framesWritten == 0) {
@@ -438,6 +457,11 @@ void DriverAlsaPimpl::ProcessDecodedStream(MsgDecodedStream* aMsg)
                iBytesSent);
 
     iBytesSent = 0;
+    iXrunCount = 0;
+    iRecoverCount = 0;
+    iWaitCount = 0;
+
+    auto decodedStreamInfo = aMsg->StreamInfo();
 
     Log::Print("DriverAlsa: Finding PcmProcessor for stream: BitDepth = %u, "
                "SampleRate = %u, Channels = %u\n",
@@ -617,6 +641,11 @@ TBool DriverAlsaPimpl::TryProfile(Profile& aProfile,
 
     err = snd_pcm_sw_params(iHandle, swParams);
     if (err < 0) return fail("snd_pcm_sw_params", err);
+
+    snd_pcm_uframes_t startThreshold = 0;
+    snd_pcm_uframes_t availMin = 0;
+    snd_pcm_sw_params_get_start_threshold(swParams, &startThreshold);
+    snd_pcm_sw_params_get_avail_min(swParams, &availMin);
 
     err = snd_pcm_prepare(iHandle);
     if (err < 0) return fail("snd_pcm_prepare", err);

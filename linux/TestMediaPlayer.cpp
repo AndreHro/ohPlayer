@@ -1,8 +1,13 @@
 #include "OhLog.h"
 #include "TestMediaPlayer.h"
 #include "RaspdacMiniIF.h"
+#include "OhLinnAmpVolume.h"
+#include "LinnAmpConfig.h"
+#include "ConfigAppPlayerLinn.h"
 #include <OpenHome/Types.h>
 #include <OpenHome/Net/Private/DviStack.h>
+#include <cstdlib>
+#include <unistd.h>
 #include <OpenHome/Av/MediaPlayer.h>
 #include <OpenHome/Av/Product.h>
 #include <OpenHome/Net/Core/DvDevice.h>
@@ -22,6 +27,7 @@
 #include <OpenHome/Configuration/ConfigManager.h>
 #include <OpenHome/Configuration/Tests/ConfigRamStore.h>
 #include <OpenHome/Av/Utils/IconDriverSongcastSender.h>
+#include "IconOpenHome.h"
 #include <OpenHome/Private/Parser.h>
 #include <OpenHome/Media/Debug.h>
 #include <OpenHome/Av/Debug.h>
@@ -141,6 +147,9 @@ void VolumeSinkLogger::SetFade(TInt aFade)
 void RebootLogger::Reboot(const Brx& aReason)
 {
     Log::Print("\n\n\nRebootLogger::Reboot. Reason:\n%.*s\n\n\n", PBUF(aReason));
+    // Exit the process; systemd (ohPlayer.service, Restart=always) restarts it.
+    fflush(stdout);
+    _exit(0);
 }
 
 
@@ -194,6 +203,7 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
     , iUiSendQueueSize(aUiSendQueueSize)
     , iUiMsgBufCount(aUiMsgBufCount)
     , iUiMsgBufBytes(aUiMsgBufBytes)
+    , iLinnAmpVolume(nullptr)
 {
     Log::Print("Shell running on port %u\n", aDvStack.Env().Shell()->Port());
     iInfoLogger = std::make_unique<Media::AllocatorInfoLogger>();
@@ -284,11 +294,9 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
                                    aUdn, mpInit);
    
     delete mpInit;
-
-    Log::Print("AudioSetup: Initialize KFR DSP + ALSA Backend...\n");
-    iDriver = std::make_unique<DriverAlsa>(
-        iMediaPlayer->Pipeline(), Brn("default"), 22052, 0, false, aKFRConfigDir);
-
+    
+    iDriver = std::make_unique<DriverAlsa>(iMediaPlayer->Pipeline(), 22052);
+#if 1
     if (iDriver == NULL)
     {
         Log::Print("%s:%d - Unable to start Audio Driver\n", __FILE__, __LINE__);
@@ -309,6 +317,7 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
     // Register with the PowerManager
     IPowerManager& powerManager = iMediaPlayer->PowerManager();
     iPowerObserver = powerManager.RegisterPowerHandler(*this, kPowerPriorityLowest, "TestMediaPlayer");
+    iStandbyObserver = powerManager.RegisterStandbyHandler(*this, kStandbyHandlerPriorityNormal, "TestMediaPlayer");
     Log::Print("%s:%d\n", __FILE__, __LINE__);
     // Register Raspdac interface notification
     iRaspdacObserver = std::make_unique<RaspdacObserver>();
@@ -331,6 +340,11 @@ TestMediaPlayer::~TestMediaPlayer()
 {
     if (iDevice) {
         ASSERT(!iDevice->Enabled());
+    }
+
+    // Clean up Linn Amp volume control
+    if (iLinnAmpVolume != nullptr) {
+        delete iLinnAmpVolume;
     }
 
     // 2. Clean up dependencies before iStoreFileWriter and iConfigRamStore drop
@@ -398,7 +412,6 @@ void TestMediaPlayer::Run()
     iOdpZeroConf =std::make_unique<OdpZeroConf>(iMediaPlayer->Env(), *iServerOdp, iMediaPlayer->FriendlyNameObservable());
     iOdpZeroConf->SetZeroConfEnabled(true);
 
-    iMediaPlayer->PowerManager().StandbyDisable(StandbyDisableReason::Boot);
     EnableDevices();
     iFsFlushPeriodic->Start();
 
@@ -620,11 +633,14 @@ void TestMediaPlayer::InitialiseSubsystems()
 IWebApp* TestMediaPlayer::CreateConfigApp(const std::vector<const Brx*>& aSources, const Brx& aResourceDir, TUint aMinWebUiResourceThreads, TUint aMaxWebUiTabs, TUint aMaxSendQueueSize, TUint aMsgBufCount, TUint aMsgBufBytes)
 {
     FileResourceHandlerFactory resourceHandlerFactory;
-    return new ConfigAppMediaPlayer(*iInfoLogger, iMediaPlayer->Env(), iMediaPlayer->Product(),
-                                    iMediaPlayer->ConfigManager(), resourceHandlerFactory, aSources,
-                                    Brn("Softplayer"), aResourceDir,
-                                    aMinWebUiResourceThreads, aMaxWebUiTabs, aMaxSendQueueSize,
-                                    aMsgBufCount, aMsgBufBytes, iRebootHandler);
+    Brn linnAmpModel(iLinnAmpVolume != nullptr ? iLinnAmpVolume->DeviceModel() : Brx::Empty());
+    Brn linnAmpSerial(iLinnAmpVolume != nullptr ? iLinnAmpVolume->DeviceId() : Brx::Empty());
+    return new ConfigAppPlayerLinn(*iInfoLogger, iMediaPlayer->Env(), iMediaPlayer->Product(),
+                                   iMediaPlayer->ConfigManager(), resourceHandlerFactory, aSources,
+                                   Brn("Softplayer"), aResourceDir,
+                                   aMinWebUiResourceThreads, aMaxWebUiTabs, aMaxSendQueueSize,
+                                   aMsgBufCount, aMsgBufBytes, iRebootHandler,
+                                   linnAmpModel, linnAmpSerial);
 }
 
 void TestMediaPlayer::InitialiseLogger()
@@ -646,8 +662,8 @@ void TestMediaPlayer::DestroyAppFramework()
 void TestMediaPlayer::WriteResource(const Brx& aUriTail, const TIpAddress& /*aInterface*/, std::vector<char*>& /*aLanguageList*/, IResourceWriter& aResourceWriter)
 {
     if (aUriTail == kSongcastSenderIconFileName) {
-        aResourceWriter.WriteResourceBegin(sizeof(kIconDriverSongcastSender), kIconDriverSongcastSenderMimeType);
-        aResourceWriter.WriteResource(kIconDriverSongcastSender, sizeof(kIconDriverSongcastSender));
+        aResourceWriter.WriteResourceBegin(sizeof(kIconOpenHome), kIconOpenHomeMimeType);
+        aResourceWriter.WriteResource(kIconOpenHome, sizeof(kIconOpenHome));
         aResourceWriter.WriteResourceEnd();
     }
 }
@@ -660,6 +676,27 @@ void TestMediaPlayer::PowerUp()
     //  - registering with IPowerManager in Run() call
     //iDevice->SetEnabled();
     //iDeviceUpnpAv->SetEnabled();
+    Log::Print("TestMediaPlayer::PowerUp\n");
+}
+
+void TestMediaPlayer::StandbyEnabled()
+{
+    Log::Print("TestMediaPlayer::StandbyEnabled\n");
+    if (iLinnAmpVolume != nullptr) {
+        iLinnAmpVolume->SetStandby(true);
+    }
+}
+
+void TestMediaPlayer::StandbyTransitioning()
+{
+}
+
+void TestMediaPlayer::StandbyDisabled(StandbyDisableReason /*aReason*/)
+{
+    Log::Print("TestMediaPlayer::StandbyDisabled\n");
+    if (iLinnAmpVolume != nullptr) {
+        iLinnAmpVolume->SetStandby(false);
+    }
 }
 
 void TestMediaPlayer::PowerDown()
@@ -782,6 +819,7 @@ OpenHome::Net::Library* TestMediaPlayerInit::CreateLibrary(
     if (aLoopback == true) {
         initParams->SetUseLoopbackNetworkAdapter();
     }
+    initParams->SetDvUpnpServerPort(51000);
     initParams->SetEnableShell(aShellPort);
     initParams->SetIPv6Supported(false);
 #ifdef LPEC_ENABLE

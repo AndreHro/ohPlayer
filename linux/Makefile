@@ -31,7 +31,8 @@ PREFIX      = /usr
 BINDIR      = $(PREFIX)/bin
 RESDIR      = $(PREFIX)/share/openhome-player
 DOCDIR      = $(PREFIX)/share/doc/openhome-player
-RESOURCEDIR = ../dependencies/$(TARG_ARCH)/ohMediaPlayer/res
+RESOURCEDIR = res
+DEPRESOURCEDIR = ../dependencies/$(TARG_ARCH)/ohMediaPlayer/res
 
 LIBS = $(shell pkg-config --libs glib-2.0) \
        -lConfigUiTestUtils -lConfigUi -lSourcePlaylist -lSourceSongcast \
@@ -98,7 +99,7 @@ install:
 	install -m 644 OpenHome-48x48.png $(DESTDIR)$(RESDIR)
 	install -m 644 copyright $(DESTDIR)$(DOCDIR)
 	cp -R $(RESOURCEDIR) $(DESTDIR)$(RESDIR)
-	cp $(RESOURCEDIR)/lang/en-gb/ConfigOptions.txt $(DESTDIR)$(RESDIR)/res/lang
+	cp $(DEPRESOURCEDIR)/lang/en-gb/ConfigOptions.txt $(DESTDIR)$(RESDIR)/res/lang
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/openhome-player
