@@ -315,12 +315,12 @@ void SoxrPcmProcessor::ProcessFragment(
 
 void SoxrPcmProcessor::ProcessCompleteFragment(const Brx& aData, TUint aNumChannels, TUint aSubsampleBytes)
 {
-    const TUint bytesPerFrame = aNumChannels * aSubsampleBytes;
-    if (bytesPerFrame == 0 || aData.Bytes() < bytesPerFrame || aData.Ptr() == nullptr) {
+    if (aSubsampleBytes < 1 || aSubsampleBytes > 4) {
         return;
     }
-
-    if (aSubsampleBytes < 1 || aSubsampleBytes > 4) {
+    
+    const TUint bytesPerFrame = aNumChannels * aSubsampleBytes;
+    if (bytesPerFrame == 0 || aData.Bytes() < bytesPerFrame || aData.Ptr() == nullptr) {
         return;
     }
 
