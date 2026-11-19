@@ -20,10 +20,12 @@ TestMediaPlayerOptions::TestMediaPlayerOptions()
     , iOptionUserAgent("", "--useragent", Brn(""), "User Agent (for HTTP requests)")
     , iOptionClockPull("", "--clockpull", "Enable clock pulling")
     , iOptionStoreFile("-s", "--storefile", Brn(""), "File for reading/writing persistent store")
-    , iOptionCamillaConfigDir("", "--camilla-config", Brn(""), "Directory containing CamillaDSP config_<samplerate>hz.yaml files")
+    , iOptionKfrConfigDir("", "--kfr-config-dir", Brn(""), "Directory containing KFR left/right impulse-response WAV files")
     , iOptionOdp("", "--odp", 0, "Port for ODP server")
     , iOptionWebUi("", "--webui", 0, "Port for Web UI server")
-    , iOptionShell("", "--shell", 0, "Port for shell")
+    , iOptionShell("", "--shell", 2323, "Port for shell (0 to disable)")
+    , iOptionRadioBrowser("", "--radiobrowser", "Enable the Radio Browser UPnP media server (radio-browser.info directory)")
+    , iOptionTestRadioMeta("", "--test-radio-meta", "Probe now-playing endpoints of test radio stations (France Inter/FIP, BBC 1/2/4, Couleur 3), print results, then exit")
 {
     iParser.AddOption(&iOptionRoom);
     iParser.AddOption(&iOptionName);
@@ -37,10 +39,12 @@ TestMediaPlayerOptions::TestMediaPlayerOptions()
     iParser.AddOption(&iOptionUserAgent);
     iParser.AddOption(&iOptionClockPull);
     iParser.AddOption(&iOptionStoreFile);
-    iParser.AddOption(&iOptionCamillaConfigDir);
+    iParser.AddOption(&iOptionKfrConfigDir);
     iParser.AddOption(&iOptionOdp);
     iParser.AddOption(&iOptionWebUi);
     iParser.AddOption(&iOptionShell);
+    iParser.AddOption(&iOptionRadioBrowser);
+    iParser.AddOption(&iOptionTestRadioMeta);
 }
 
 void TestMediaPlayerOptions::AddOption(Option* aOption)
@@ -113,9 +117,9 @@ const OptionString& TestMediaPlayerOptions::StoreFile() const
     return iOptionStoreFile;
 }
 
-const OptionString& TestMediaPlayerOptions::CamillaConfigDir() const
+const OptionString& TestMediaPlayerOptions::KfrConfigDir() const
 {
-    return iOptionCamillaConfigDir;
+    return iOptionKfrConfigDir;
 }
 
 const OptionUint& TestMediaPlayerOptions::OptionOdp() const
@@ -131,4 +135,14 @@ const OptionUint& TestMediaPlayerOptions::OptionWebUi() const
 const OptionUint& TestMediaPlayerOptions::Shell() const
 {
     return iOptionShell;
+}
+
+const OptionBool& TestMediaPlayerOptions::RadioBrowser() const
+{
+    return iOptionRadioBrowser;
+}
+
+const OptionBool& TestMediaPlayerOptions::TestRadioMeta() const
+{
+    return iOptionTestRadioMeta;
 }

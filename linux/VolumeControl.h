@@ -10,6 +10,8 @@ class VolumeControl : public IVolume, public IBalance, public IFade
 public:
     ~VolumeControl();
     VolumeControl(TBool aDisableVolume, const TChar* aCard, const std::vector<Brn>& aMixerNames); 
+    TBool IsVolumeSupported() const;
+    void SetVolumeFixed(TUint aVolume);
 private: // from IVolume
     void SetVolume(TUint aVolume) override;
 private: // from IBalance

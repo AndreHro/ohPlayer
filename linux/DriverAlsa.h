@@ -7,7 +7,6 @@
 #include <OpenHome/Private/Thread.h>
 
 
-
 namespace OpenHome {
 namespace Media {
 
@@ -98,11 +97,6 @@ public:
         const Brx& aKfrIrConfigDir=Brn(""));
     DriverAlsa(IPipeline& aPipeline, TUint aBufferUs, TUint aOutputSampleRate=0,
                const Brx& aKfrIrConfigDir=Brn(""));
-};
-class CamillaDspDriver final : public PipelineDriverBase
-{
-public:
-    CamillaDspDriver(IPipeline& aPipeline, const Brx& aCamilloDsp, TUint aBufferUs);
 };
 
 } // namespace Media

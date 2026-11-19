@@ -1,0 +1,146 @@
+#include "LinnAmpConfig.h"
+#include <OpenHome/Private/Converter.h>
+#include <OpenHome/Private/Printer.h>
+
+namespace OpenHome {
+namespace Av {
+
+const Brn LinnAmpConfig::kKeySerialPort("LinnAmp.SerialPort");
+const Brn LinnAmpConfig::kKeyBass("LinnAmp.Bass");
+const Brn LinnAmpConfig::kKeyTreble("LinnAmp.Treble");
+const Brn LinnAmpConfig::kKeyAlsaVolume("LinnAmp.AlsaVolume");
+const Brn LinnAmpConfig::kKeySource("LinnAmp.Source");
+const TInt LinnAmpConfig::kToneMin;
+const TInt LinnAmpConfig::kToneMax;
+const TInt LinnAmpConfig::kSourceMin;
+const TInt LinnAmpConfig::kSourceMax;
+const TUint LinnAmpConfig::kMaxSerialPortBytes;
+
+LinnAmpConfig::LinnAmpConfig(Configuration::IConfigInitialiser& aConfigInit)
+{
+    // Registering a ConfigVal with the ConfigInitialiser makes it appear in the web config app
+    iConfigSerialPort = std::make_unique<Configuration::ConfigText>(
+        aConfigInit, kKeySerialPort, 0 /* aMinLength */, kMaxSerialPortBytes, Brx::Empty(),
+        true /* aRebootRequired: applied at next start */);
+    iConfigBass = std::make_unique<Configuration::ConfigNum>(
+        aConfigInit, kKeyBass, kToneMin, kToneMax, 0,
+        true /* aRebootRequired: applied at next start */);
+    iConfigTreble = std::make_unique<Configuration::ConfigNum>(
+        aConfigInit, kKeyTreble, kToneMin, kToneMax, 0,
+        true /* aRebootRequired: applied at next start */);
+    iConfigAlsaVolume = std::make_unique<Configuration::ConfigNum>(
+        aConfigInit, kKeyAlsaVolume, 0, 100, 100,
+        true /* aRebootRequired: applied at next start */);
+    iConfigSource = std::make_unique<Configuration::ConfigNum>(
+        aConfigInit, kKeySource, kSourceMin, kSourceMax, kSourceMin,
+        true /* aRebootRequired: applied at next start */);
+}
+
+LinnAmpConfig::~LinnAmpConfig()
+{
+}
+
+void LinnAmpConfig::ReadSerialPortFromStore(Configuration::IStoreReadWrite& aStore, Bwx& aSerialPort)
+{
+    try {
+        aStore.Read(kKeySerialPort, aSerialPort);
+    }
+    catch (StoreKeyNotFound&) {
+        aSerialPort.Replace(Brx::Empty());
+    }
+}
+
+TBool LinnAmpConfig::ReadVolumeControlEnabledFromStore(Configuration::IStoreReadWrite& aStore, TBool aDefault)
+{
+    // ohPipeline choice, persisted as big-endian uint32 (1 == Yes, 0 == No)
+    static const Brn kKeyVolumeEnabled("Volume.Enabled");
+    Bws<sizeof(TUint)> buf;
+    try {
+        aStore.Read(kKeyVolumeEnabled, buf);
+        return (Converter::BeUint32At(buf, 0) == 1);
+    }
+    catch (StoreKeyNotFound&) {
+    }
+    return aDefault;
+}
+
+void LinnAmpConfig::WriteVolumeControlEnabled(Configuration::IStoreReadWrite& aStore, TBool aEnabled)
+{
+    static const Brn kKeyVolumeEnabled("Volume.Enabled");
+    const TUint32 val = aEnabled ? 1 : 0; // eStringIdYes / eStringIdNo
+    const TByte* ptr = reinterpret_cast<const TByte*>(&val);
+    TByte be[sizeof(TUint)];
+    be[0] = ptr[3];
+    be[1] = ptr[2];
+    be[2] = ptr[1];
+    be[3] = ptr[0];
+    aStore.Write(kKeyVolumeEnabled, Brn(be, sizeof(be)));
+}
+
+TInt LinnAmpConfig::ReadToneFromStore(Configuration::IStoreReadWrite& aStore, const Brx& aKey, TInt aDefault)
+{
+    // ConfigNum values are persisted as big-endian int32
+    Bws<sizeof(TInt)> buf;
+    try {
+        aStore.Read(aKey, buf);
+        TInt val = static_cast<TInt>(Converter::BeUint32At(buf, 0));
+        if (val >= kToneMin && val <= kToneMax) {
+            return val;
+        }
+    }
+    catch (StoreKeyNotFound&) {
+    }
+    return aDefault;
+}
+
+TUint LinnAmpConfig::ReadAlsaVolumeFromStore(Configuration::IStoreReadWrite& aStore, TUint aDefault)
+{
+    // ConfigNum values are persisted as big-endian int32
+    Bws<sizeof(TInt)> buf;
+    try {
+        aStore.Read(kKeyAlsaVolume, buf);
+        TInt val = static_cast<TInt>(Converter::BeUint32At(buf, 0));
+        if (val >= 0 && val <= 100) {
+            return static_cast<TUint>(val);
+        }
+    }
+    catch (StoreKeyNotFound&) {
+    }
+    return aDefault;
+}
+
+TInt LinnAmpConfig::ReadSourceFromStore(Configuration::IStoreReadWrite& aStore, TInt aDefault)
+{
+    // ConfigNum values are persisted as big-endian int32
+    Bws<sizeof(TInt)> buf;
+    try {
+        aStore.Read(kKeySource, buf);
+        TInt val = static_cast<TInt>(Converter::BeUint32At(buf, 0));
+        if (val >= kSourceMin && val <= kSourceMax) {
+            return val;
+        }
+    }
+    catch (StoreKeyNotFound&) {
+    }
+    return aDefault;
+}
+
+TUint LinnAmpConfig::ReadVolumeLimitFromStore(Configuration::IStoreReadWrite& aStore, TUint aDefault)
+{
+    // Key defined by ohPipeline (VolumeConfig::kKeyLimit), persisted as big-endian int32
+    static const Brn kKeyVolumeLimit("Volume.Limit");
+    Bws<sizeof(TInt)> buf;
+    try {
+        aStore.Read(kKeyVolumeLimit, buf);
+        TInt limit = static_cast<TInt>(Converter::BeUint32At(buf, 0));
+        if (limit >= 0 && limit <= 100) {
+            return static_cast<TUint>(limit);
+        }
+    }
+    catch (StoreKeyNotFound&) {
+    }
+    return aDefault;
+}
+
+} // namespace Av
+} // namespace OpenHome

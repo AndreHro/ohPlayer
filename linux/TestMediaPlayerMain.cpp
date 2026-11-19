@@ -1,5 +1,8 @@
 //#include "OpenHomePlayer.h"
 #include "TestMediaPlayer.h"
+#include "RadioNowPlayingTest.h"
+#include "OhLog.h"
+#include <OpenHome/Private/Network.h> // SslContext
 #include <OpenHome/Types.h>
 #include <OpenHome/Media/Tests/Cdecl.h>
 #include <OpenHome/Media/Tests/GetCh.h>
@@ -60,31 +63,37 @@ void TestMediaPlayerThread::RunInThread()
     CpStack* cpStack = nullptr;
     DvStack* dvStack = nullptr;
     iLib->StartCombined(adapter->Subnet(), cpStack, dvStack);
+    
+    // --test-radio-meta: probe now-playing endpoints of test radio stations and exit
+    if (iOptions.TestRadioMeta().Value()) {
+        SslContext ssl;
+        Av::TestRadioNowPlaying(iLib->Env(), ssl, iOptions.UserAgent().Value());
+        adapter->RemoveRef(cookie);
+        return;
+    }
+
 
     // Seed random number generator.
     TestMediaPlayerInit::SeedRandomNumberGenerator(dvStack->Env(), iOptions.Room().Value(), adapter->Address(), dvStack->ServerUpnp());
     adapter->RemoveRef(cookie);
 
-    // Set/construct UDN.
-    Bwh udn;
-    // Note: prefix udn with 4c494e4e- to get older versions of Linn Konfig to recognise our devices
-    TestMediaPlayerInit::AppendUniqueId(dvStack->Env(), iOptions.Udn().Value(), Brn("TestMediaPlayer"), udn);
-    Log::Print("UDN is %.*s\n", PBUF(udn));
+    // The device UDN is derived in the TestMediaPlayer constructor: an
+    // explicit -u/--udn is used as provided, otherwise a canonical uuid is
+    // derived from the effective room (configured Product.Room, falling
+    // back to the -r argument).
 
-    Log::Print("%s:%d - %s\n", __FILE__, __LINE__, iOptions.Room().CString());
-    Log::Print("%s:%d - %s\n", __FILE__, __LINE__, iOptions.Name().CString());
-    Log::Print("%s:%d - %s\n", __FILE__, __LINE__, iOptions.TuneIn().CString());
-    Log::Print("%s:%d - %s\n", __FILE__, __LINE__, iOptions.Tidal().CString());
-    Log::Print("%s:%d - %s\n", __FILE__, __LINE__, iOptions.Qobuz().CString());
-    Log::Print("%s:%d - %s\n", __FILE__, __LINE__, iOptions.UserAgent().CString());
-    Log::Print("%s:%d - %s\n", __FILE__, __LINE__, iOptions.StoreFile().CString());
-    Log::Print("%s:%d - %u\n", __FILE__, __LINE__, iOptions.OptionOdp().Value());
-    Log::Print("%s:%d - %u\n", __FILE__, __LINE__, iOptions.OptionWebUi().Value());
+    OhLog::Print("Room: %s, Name: %s\n", iOptions.Room().CString(), iOptions.Name().CString());
+    OhLog::Print("TuneIn: %s, Tidal: %s, Qobuz: %s\n",
+        iOptions.TuneIn().CString(), iOptions.Tidal().CString(), iOptions.Qobuz().CString());
+    OhLog::Print("UserAgent: %s, StoreFile: %s\n",
+        iOptions.UserAgent().CString(), iOptions.StoreFile().CString());
+    OhLog::Print("ODP port: %u, Web UI port: %u\n",
+        iOptions.OptionOdp().Value(), iOptions.OptionWebUi().Value());
 
     // Create TestMediaPlayer.
-    TestMediaPlayer* player = new TestMediaPlayer(*dvStack, *cpStack, udn, iOptions.Room().CString(), iOptions.Name().CString(),
+    TestMediaPlayer* player = new TestMediaPlayer(*dvStack, *cpStack, iOptions.Udn().Value(), iOptions.Room().CString(), iOptions.Name().CString(),
         iOptions.TuneIn().Value(), iOptions.Tidal().Value(), iOptions.Qobuz().Value(),
-        iOptions.UserAgent().Value(), iOptions.StoreFile().CString(), iOptions.CamillaConfigDir().Value(),
+        iOptions.UserAgent().Value(), iOptions.StoreFile().CString(), iOptions.KfrConfigDir().Value(),
         iOptions.OptionOdp().Value(), iOptions.OptionWebUi().Value());
     Log::Print("%s:%d\n", __FILE__, __LINE__);
     Log::Print("%s:%d\n", __FILE__, __LINE__);

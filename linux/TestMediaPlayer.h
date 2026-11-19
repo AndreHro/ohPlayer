@@ -3,10 +3,14 @@
 #include <OpenHome/Types.h>
 #include <OpenHome/Buffer.h>
 #include "VolumeControl.h"
-#include "OhLinnAmpVolume.h"
-#include "LinnAmpConfig.h"
+#include "LinnAmp/OhLinnAmpVolume.h"
+#include "LinnAmp/LinnAmpConfig.h"
+#include "PipelineConfig.h"
+#include "RadioPresetsStatic.h"
+#include "RadioBrowserMediaServer.h"
 
 #include <OpenHome/Av/MediaPlayer.h>
+#include <OpenHome/Av/Songcast/OhmMsg.h>
 #include <OpenHome/Net/Core/DvDevice.h>
 #include <OpenHome/Av/Utils/DriverSongcastSender.h>
 #include <OpenHome/Media/PipelineManager.h>
@@ -67,6 +71,7 @@ namespace Av {
     class FriendlyNameHandler;
     class RamStore;
     class IPlaylistLoader;
+    class StoreWithOverriddenValue;
 namespace Test {
 
 class VolumeProfile : public IVolumeProfile
@@ -113,6 +118,34 @@ public: // from IRebootHandler
     void Reboot(const Brx& aReason) override;
 };
 
+/*
+ * Observes the Songcast receiver's ohm messages and traces the media latency
+ * announced by the sender whenever it changes. This latency is what the
+ * pipeline injects as MsgDelay (ProtocolOhBase converts it via
+ * Jiffies::FromSongcastTime) - the master variable of the multiroom offset
+ * that the PhaseAdjuster aims to match by dropping/injecting audio.
+ *
+ * Also warns when the configured downstream latency (StarvationRamperMinSize
+ * + DriverAlsaBuffer) exceeds the sender's target: above the target the
+ * PhaseAdjuster cannot compensate and the receiver lags the sender in
+ * multiroom. The check runs on each latency change (stream lifecycle), so
+ * it always reflects the current group's sender.
+ */
+class SongcastLatencyLogger : public IOhmMsgProcessor, private INonCopyable
+{
+public:
+    SongcastLatencyLogger(TUint aDownstreamJiffies);
+public: // from IOhmMsgProcessor
+    void Process(OhmMsgAudio& aMsg) override;
+    void Process(OhmMsgTrack& aMsg) override;
+    void Process(OhmMsgMetatext& aMsg) override;
+private:
+    void CheckTarget(TUint aTargetJiffies);
+private:
+    const TUint iDownstreamJiffies;
+    TUint iLastLatency;
+};
+
 class DummyRaatSignalPath
     : public IRaatSignalPath
     , public IRaatSignalPathObservable
@@ -134,21 +167,28 @@ private:
     static const TUint kNumOdpSessions = 4;
     static const TUint kMinWebUiResourceThreads = 4;
     static const TUint kMaxWebUiTabs = 4;
-    static const TUint kUiSendQueueSize = 100;
-    static const TUint kUiMsgBufCount = kUiSendQueueSize + ((kUiSendQueueSize + 1) / 2);
-    static const TUint kUiMsgBufBytes = 16;
+    // Web ui config message pool. Must cover the worst case of the whole
+    // pipeline: a session's values can stay held in a framework send fifo
+    // (Send blocks, holding the allocated messages; ohPipeline's ConfigTab
+    // FIXME keeps a dead handler's messages until the tab is re-allocated),
+    // so with kMaxWebUiTabs fifos of kUiSendQueueSize slots, held messages
+    // can accumulate up to the fifo capacity times the buffers per message.
+    // Size the pool to comfortably cover 4 fifos worth of typical messages
+    // (~3 buffers each) plus re-subscribe bursts.
+    static const TUint kUiSendQueueSize = 512;
+    static const TUint kUiMsgBufCount = 4096;
+    static const TUint kUiMsgBufBytes = 64;
     static const TUint kMaxPinsDevice = 6;
     static const TUint kFsFlushFreqMs = 60 * 1000; // 1 minute
     static const TUint kDsdMaxSampleRate = 5644800; // DSD128 ; 11289600 DSD256
     static const TUint kDsdSampleBlockWords = 6; // Specifies if the test player outputs DSD as 16xL, 16xR [32 bits = 1 word] or 4 x (24xL, 24xR) [192 bits = 6]
     static const TUint kDsdPadBytesPerChunk = 2;
     TUint              iExitRequested=0;
-
 public:
     TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack, const Brx& aUdn, const TChar* aRoom, const TChar* aProductName,
                     const Brx& aTuneInPartnerId, const Brx& aTidalId, const Brx& aQobuzIdSecret, const Brx& aUserAgent,
-                    const TChar* aStoreFile, const Brx& aKFRConfigDir, TUint aOdpPort=0, TUint aWebUiPort=0,
-                    TUint aMinWebUiResourceThreads=kMinWebUiResourceThreads, TUint aMaxWebUiTabs=kMaxWebUiTabs, TUint aUiSendQueueSize=kUiSendQueueSize, TUint aUiMsgBufCount=kUiMsgBufCount, TUint aUiMsgBufBytes=kUiMsgBufBytes);
+                    const TChar* aStoreFile, const Brx& aKFRConfigDir, TUint aOdpPort=0, TUint aWebUiPort=0, TBool aEnableRadioBrowser=false,
+                    TUint aMinWebUiResourceThreads=kMinWebUiResourceThreads, TUint aMaxWebUiTabs=kMaxWebUiTabs, TUint aUiSendQueueSize=kUiSendQueueSize, TUint aUiMsgBufCount=kUiMsgBufCount, TUint aUiMsgBufBytes=kUiMsgBufBytes );
     virtual ~TestMediaPlayer();
     void RequestExit();
     void SetPullableClock(Media::IPullableClock& aPullableClock);
@@ -196,9 +236,13 @@ protected:
     std::unique_ptr<Net::DvDeviceStandard> iDevice;
     std::unique_ptr<Net::DvDevice> iDeviceUpnpAv;
 
+    // Store wrapper given to the MediaPlayer. Declared before iMediaPlayer
+    // so it outlives it (members are destroyed in reverse declaration order).
+    std::unique_ptr<Av::StoreWithOverriddenValue> iMediaPlayerStore;
     std::unique_ptr<MediaPlayer> iMediaPlayer;
     std::unique_ptr<Web::WebAppFramework> iAppFramework;    // FIXME - add getter to IMediaPlayer and make private
     RebootLogger iRebootHandler;
+    std::unique_ptr<SongcastLatencyLogger> iSongcastLatencyLogger;
     Media::IPullableClock* iPullableClock;
     std::unique_ptr<Media::AllocatorInfoLogger> iInfoLogger;
     std::unique_ptr<IPlaylistLoader> iPlaylistLoader;
@@ -214,8 +258,8 @@ private:
     const Brh iUserAgent;
     IOhmTimestamper* iTxTimestamper;
     IOhmTimestamper* iRxTimestamper;
-    //VolumeSinkLogger iVolumeLogger;
-    std::unique_ptr<VolumeControl>   iVolumeCtrl;
+    std::unique_ptr<VolumeControl> iVolumeCtrl;
+    VolumeSinkLogger iVolumeSinkLogger;
     std::unique_ptr<Media::AudioTimeCpu> iAudioTime;
     Bws<Uri::kMaxUriBytes+1> iPresentationUrl;
     std::unique_ptr<Media::LoggingPipelineObserver> iPipelineObserver;
@@ -235,6 +279,11 @@ private:
     TUint iUiMsgBufCount;
     TUint iUiMsgBufBytes;
 
+    std::unique_ptr<OhLinnAmpVolume> iLinnAmpVolume;
+    std::unique_ptr<LinnAmpConfig> iLinnAmpConfig;
+    std::unique_ptr<PipelineConfig> iPipelineConfig;
+    std::unique_ptr<RadioPresetsStatic> iRadioPresetsStatic;
+    std::unique_ptr<Av::RadioBrowserMediaServer> iRadioBrowserMediaServer;
     std::unique_ptr<OpenHome::Media::PipelineDriverBase> iDriver;
     std::unique_ptr<Media::IPipelineObserver>    iRaspdacObserver;
     std::unique_ptr<IVolumeObserver>         iRaspdacVolumeObserver;
@@ -258,10 +307,12 @@ public:
     const TestFramework::OptionString& UserAgent() const;
     const TestFramework::OptionBool& ClockPull() const;
     const TestFramework::OptionString& StoreFile() const;
-    const TestFramework::OptionString& CamillaConfigDir() const;
+    const TestFramework::OptionString& KfrConfigDir() const;
     const TestFramework::OptionUint& OptionOdp() const;
     const TestFramework::OptionUint& OptionWebUi() const;
     const TestFramework::OptionUint& Shell() const;
+    const TestFramework::OptionBool& RadioBrowser() const;
+    const TestFramework::OptionBool& TestRadioMeta() const;
 private:
     TestFramework::OptionParser iParser;
     TestFramework::OptionString iOptionRoom;
@@ -276,10 +327,12 @@ private:
     TestFramework::OptionString iOptionUserAgent;
     TestFramework::OptionBool iOptionClockPull;
     TestFramework::OptionString iOptionStoreFile;
-    TestFramework::OptionString iOptionCamillaConfigDir;
+    TestFramework::OptionString iOptionKfrConfigDir;
     TestFramework::OptionUint iOptionOdp;
     TestFramework::OptionUint iOptionWebUi;
     TestFramework::OptionUint iOptionShell;
+    TestFramework::OptionBool iOptionRadioBrowser;
+    TestFramework::OptionBool iOptionTestRadioMeta;
 };
 
 // Not very nice, but only to allow reusable test functions.
@@ -292,6 +345,12 @@ public:
     static OpenHome::Net::Library* CreateLibrary(const TChar* aRoom, TBool aLoopback, TUint aAdapter, TUint aShellPort);  // creates lib; client must start appropriate stacks
     static void SeedRandomNumberGenerator(Environment& aEnv, const Brx& aRoom, TIpAddress aAddress, Net::DviServerUpnp& aServer);    // seed from room + server port
     static void AppendUniqueId(Environment& aEnv, const Brx& aUserUdn, const Brx& aDefaultUdn, Bwh& aOutput);
+    /*
+     * Derives a canonical UPnP uuid (8-4-4-4-12 hex, no "uuid:" prefix)
+     * from a stable seed (e.g. the room name), prefixed with 4c494e4e ("LINN")
+     * for recognition by Linn tools. Deterministic: same seed, same uuid.
+     */
+    static void CreateCanonicalUuid(const Brx& aSeed, Bwh& aUuid);
 };
 
 } // namespace Test

@@ -268,7 +268,7 @@ std::string IrStamp(const std::filesystem::path& aDir)
         const auto t = std::filesystem::last_write_time(aDir / name, ec);
         stamp += '|';
         if (!ec) {
-            stamp += std::to_string(t.time_since_epoch().count());
+            stamp += std::to_string(static_cast<long long>(t.time_since_epoch().count()));
         }
     }
     return stamp;
@@ -506,7 +506,7 @@ KfrPcmProcessor::KfrPcmProcPimpl::KfrPcmProcPimpl(
         const auto rawIrs = GetRawIrs(dir, iSpec.iLowLatency);
         if (rawIrs->hasLeft) {
             const uint32_t irRate = rawIrs->left.sampleRate;
-            if (irRate == iOutputRate) {
+            if (iSpec.iLowLatency || irRate == iOutputRate) {
                 iFirBeforeSrc = false;
             }
             else if (irRate == iInputRate) {

@@ -5,6 +5,7 @@
 #include "OhLog.h"
 
 #include <alsa/asoundlib.h>
+#include <errno.h>
 #include <memory>
 #include <atomic>
 #include <algorithm>
@@ -321,8 +322,8 @@ void DriverAlsaPimpl::Write(const Brx& aData)
             }
 
             ++iRecoverCount;
-            Log::Print("DriverAlsa: recovered from %s (recoveries=%u)",
-                       snd_strerror(writeError),
+               OhLog::Print("DriverAlsa: recovered from %s (recoveries=%u)",
+                           snd_strerror(static_cast<int>(framesWritten)),
                        iRecoverCount);
             continue;
         }
@@ -406,34 +407,34 @@ void DriverAlsaPimpl::LogPCMState()
     switch (snd_pcm_state(iHandle))
     {
         case SND_PCM_STATE_OPEN:
-            Log::Print("PCM STATE: SND_PCM_STATE_OPEN\n");
+            OhLog::PrintDebug("DriverAlsa: PCM STATE: SND_PCM_STATE_OPEN\n");
             break;
         case SND_PCM_STATE_SETUP:
-            Log::Print("PCM STATE: SND_PCM_STATE_SETUP\n");
+            OhLog::PrintDebug("DriverAlsa: PCM STATE: SND_PCM_STATE_SETUP\n");
             break;
         case SND_PCM_STATE_PREPARED:
-            Log::Print("PCM STATE: SND_PCM_STATE_PREPARED\n");
+            OhLog::PrintDebug("DriverAlsa: PCM STATE: SND_PCM_STATE_PREPARED\n");
             break;
         case SND_PCM_STATE_RUNNING:
-            Log::Print("PCM STATE: SND_PCM_STATE_RUNNING\n");
+            OhLog::PrintDebug("DriverAlsa: PCM STATE: SND_PCM_STATE_RUNNING\n");
             break;
         case SND_PCM_STATE_XRUN:
-            Log::Print("PCM STATE: SND_PCM_STATE_XRUN\n");
+            OhLog::PrintDebug("DriverAlsa: PCM STATE: SND_PCM_STATE_XRUN\n");
             break;
         case SND_PCM_STATE_DRAINING:
-            Log::Print("PCM STATE: SND_PCM_STATE_DRAINING\n");
+            OhLog::PrintDebug("DriverAlsa: PCM STATE: SND_PCM_STATE_DRAINING\n");
             break;
         case SND_PCM_STATE_PAUSED:
-            Log::Print("PCM STATE: SND_PCM_STATE_PAUSED\n");
+            OhLog::PrintDebug("DriverAlsa: PCM STATE: SND_PCM_STATE_PAUSED\n");
             break;
         case SND_PCM_STATE_SUSPENDED:
-            Log::Print("PCM STATE: SND_PCM_STATE_SUSPENDED\n");
+            OhLog::PrintDebug("DriverAlsa: PCM STATE: SND_PCM_STATE_SUSPENDED\n");
             break;
         case SND_PCM_STATE_DISCONNECTED:
-            Log::Print("PCM STATE: SND_PCM_STATE_DISCONNECTED\n");
+            OhLog::PrintDebug("DriverAlsa: PCM STATE: SND_PCM_STATE_DISCONNECTED\n");
             break;
         default:
-            Log::Print("PCM STATE: UNKNOWN\n");
+            OhLog::PrintDebug("DriverAlsa: PCM STATE: UNKNOWN\n");
             break;
     }
 }
@@ -461,7 +462,6 @@ void DriverAlsaPimpl::ProcessDecodedStream(MsgDecodedStream* aMsg)
     iRecoverCount = 0;
     iWaitCount = 0;
 
-    auto decodedStreamInfo = aMsg->StreamInfo();
 
     Log::Print("DriverAlsa: Finding PcmProcessor for stream: BitDepth = %u, "
                "SampleRate = %u, Channels = %u\n",
@@ -588,21 +588,23 @@ TBool DriverAlsaPimpl::TryProfile(Profile& aProfile,
         return false;
     }
 
-    const uint64_t requestedBufferFrames =
+    const uint64_t requestedFrames =
         (static_cast<uint64_t>(aBufferUs) * aSampleRate + 999999) / 1000000;
-    const snd_pcm_uframes_t minimumBufferFrames = iLowLatencyMode ? 4096 : 8192;
-    snd_pcm_uframes_t bufferSize = iLowLatencyMode
-        ? minimumBufferFrames
-        : std::max<snd_pcm_uframes_t>(
-              minimumBufferFrames,
-              static_cast<snd_pcm_uframes_t>(requestedBufferFrames));
-    snd_pcm_uframes_t periodSize = 1024;
+    const snd_pcm_uframes_t requestedBufferFrames =
+        static_cast<snd_pcm_uframes_t>(std::max<uint64_t>(1, requestedFrames));
+    snd_pcm_uframes_t periodSize = iLowLatencyMode
+        ? std::max<snd_pcm_uframes_t>(1, requestedBufferFrames / 4)
+        : 1024;
     err = snd_pcm_hw_params_set_period_size_near(iHandle,
                                                  hwParams,
                                                  &periodSize,
                                                  nullptr);
     if (err < 0) return fail("snd_pcm_hw_params_set_period_size_near", err);
 
+    const snd_pcm_uframes_t minimumBufferFrames = iLowLatencyMode
+        ? 2 * periodSize
+        : 8192;
+    snd_pcm_uframes_t bufferSize = std::max(minimumBufferFrames, requestedBufferFrames);
     err = snd_pcm_hw_params_set_buffer_size_near(iHandle,
                                                  hwParams,
                                                  &bufferSize);
@@ -676,6 +678,14 @@ TUint DriverAlsaPimpl::DriverDelayJiffies(TUint aSampleRate)
     }
 
     snd_pcm_sframes_t delayFrames = 0;
+    // While the stream is (re)configured - e.g. a live radio switching sample
+    // rate 24k->48k - the handle is in SETUP/OPEN state and snd_pcm_delay()
+    // returns -EBADF. That is expected, not an error: report no delay.
+    const snd_pcm_state_t state = snd_pcm_state(iHandle);
+    if (state != SND_PCM_STATE_PREPARED && state != SND_PCM_STATE_RUNNING
+        && state != SND_PCM_STATE_PAUSED && state != SND_PCM_STATE_XRUN) {
+        return 0;
+    }
     int ret = snd_pcm_delay(iHandle, &delayFrames);
 
     if (ret < 0) {
@@ -855,4 +865,3 @@ Msg* PipelineDriverBase::ProcessMsg(MsgDrain* aMsg)
 
     return aMsg;
 }
-

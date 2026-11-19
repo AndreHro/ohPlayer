@@ -1,0 +1,99 @@
+#include "ConfigAppPlayerLinn.h"
+#include "LinnAmp/LinnAmpConfig.h"
+#include "PipelineConfig.h"
+#include "RadioPresetsStatic.h"
+#include "VersionInfo.h"
+#include <OpenHome/Web/ConfigUi/ConfigUi.h>
+
+namespace OpenHome {
+namespace Av {
+
+static const Brn kKeyLinnAmpModel("LinnAmp.Model");
+static const Brn kKeyLinnAmpSerial("LinnAmp.Serial");
+static const Brn kKeyLinnAmpHwVersion("LinnAmp.HwVersion");
+static const Brn kKeyLinnAmpSwVersion("LinnAmp.SwVersion");
+static const Brn kKeySwVersionOhNet("About.OhNetVersion");
+static const Brn kKeySwVersionOhPipeline("About.OhPipelineVersion");
+static const Brn kKeySwVersionOhPlayer("About.OhPlayerCommit");
+
+ConfigAppPlayerLinn::ConfigAppPlayerLinn(IInfoAggregator& aInfoAggregator,
+                                         Environment& aEnv,
+                                         Product& aProduct,
+                                         Configuration::IConfigManager& aConfigManager,
+                                         Web::IConfigAppResourceHandlerFactory& aResourceFactory,
+                                         const std::vector<const Brx*>& aSources,
+                                         const Brx& aResourcePrefix, const Brx& aResourceDir,
+                                         TUint aResourceHandlerCount, TUint aMaxTabs, TUint aSendQueueSize,
+                                         TUint aMsgBufCount, TUint aMsgBufBytes,
+                                         IRebootHandler& aRebootHandler,
+                                         const Brx& aLinnAmpModel, const Brx& aLinnAmpSerial,
+                                         const Brx& aLinnAmpHwVersion, const Brx& aLinnAmpSwVersion,
+                                         TBool aLinnAmpActive)
+    : Web::ConfigAppMediaPlayer(aInfoAggregator, aEnv, aProduct, aConfigManager, aResourceFactory,
+                                aSources, aResourcePrefix, aResourceDir,
+                                aResourceHandlerCount, aMaxTabs, aSendQueueSize,
+                                aMsgBufCount, aMsgBufBytes, aRebootHandler)
+{
+    // Read-only info fields for the detected amp
+    AddValue(new Web::ConfigUiValRo(kKeyLinnAmpModel, Brn(aLinnAmpModel)));
+    AddValue(new Web::ConfigUiValRo(kKeyLinnAmpSerial, Brn(aLinnAmpSerial)));
+    AddValue(new Web::ConfigUiValRo(kKeyLinnAmpHwVersion, Brn(aLinnAmpHwVersion)));
+    AddValue(new Web::ConfigUiValRo(kKeyLinnAmpSwVersion, Brn(aLinnAmpSwVersion)));
+    // Read-only software version fields (generated at compile time by the Makefile)
+    AddValue(new Web::ConfigUiValRo(kKeySwVersionOhNet, Brn(VersionInfo::kOhNet)));
+    AddValue(new Web::ConfigUiValRo(kKeySwVersionOhPipeline, Brn(VersionInfo::kOhPipeline)));
+    AddValue(new Web::ConfigUiValRo(kKeySwVersionOhPlayer, Brn(VersionInfo::kOhPlayerCommit)));
+    // Editable Linn Amp settings
+    AddConfigText(LinnAmpConfig::kKeySerialPort);
+    // Radio presets (static station list)
+    {
+        Bws<RadioPresetsStatic::kKeyBytes> key;
+        static const Brn kSuffixName(".Name");
+        static const Brn kSuffixUri(".Uri");
+        static const Brn kSuffixImage(".Image");
+        for (TUint i = 0; i < RadioPresetsStatic::kNumPresets; i++) {
+            RadioPresetsStatic::GetPresetKey(i, kSuffixName, key);
+            AddConfigText(key);
+            RadioPresetsStatic::GetPresetKey(i, kSuffixUri, key);
+            AddConfigText(key);
+            RadioPresetsStatic::GetPresetKey(i, kSuffixImage, key);
+            AddConfigText(key);
+            // Compiled-in defaults, read-only: used by the web ui "reset preset"
+            // button to restore the shipped values over any manual edit.
+            Bws<RadioPresetsStatic::kMaxNameBytes> defName;
+            Bws<RadioPresetsStatic::kMaxUriBytes> defUri;
+            Bws<RadioPresetsStatic::kMaxImageUriBytes> defImage;
+            RadioPresetsStatic::GetDefaultPreset(i, defName, defUri, defImage);
+            RadioPresetsStatic::GetPresetKey(i, Brn(".Default.Name"), key);
+            AddValue(new Web::ConfigUiValRo(key, Brn(defName)));
+            RadioPresetsStatic::GetPresetKey(i, Brn(".Default.Uri"), key);
+            AddValue(new Web::ConfigUiValRo(key, Brn(defUri)));
+            RadioPresetsStatic::GetPresetKey(i, Brn(".Default.Image"), key);
+            AddValue(new Web::ConfigUiValRo(key, Brn(defImage)));
+        }
+    }
+    AddConfigNum(LinnAmpConfig::kKeyBass);
+    AddConfigNum(LinnAmpConfig::kKeyTreble);
+    AddConfigNum(LinnAmpConfig::kKeyAlsaVolume);
+    AddConfigNum(LinnAmpConfig::kKeySource);
+    // Editable pipeline buffer settings (Songcast tab)
+    AddConfigNum(PipelineConfig::kKeyStarvationRamperMinSize);
+    AddConfigNum(PipelineConfig::kKeyEncodedReservoirSize);
+    AddConfigNum(PipelineConfig::kKeyAlsaBufferUs);
+    // Expose ohPipeline's internal volume control toggle (hidden by default).
+    // Allows disabling the volume control point-side on setups where the
+    // sound card has no mixer and no external amplifier controls volume.
+    // When an external Linn amplifier handles volume, the internal volume is
+    // inactive by definition, so the field is read-only and reports No
+    // (the MediaPlayer's ConfigVal holds the runtime-enabled value used to
+    // create the Volume provider; the user's setting in the store is No).
+    if (aLinnAmpActive) {
+        AddValue(new Web::ConfigUiValRo(Brn("Volume.Enabled"), Brn("No")));
+    }
+    else {
+        AddConfigChoiceConditional(Brn("Volume.Enabled"));
+    }
+}
+
+} // namespace Av
+} // namespace OpenHome

@@ -18,7 +18,7 @@ public:
     VolumeControlPimpl(const TChar* aCard, const std::vector<Brn>& aMixerNames);
     ~VolumeControlPimpl();
 
-    TBool IsVolumeSupported() { return iElem != nullptr; }
+    TBool IsVolumeSupported() const { return iElem != nullptr; }
     void SetVolume(TUint aVolume) override;
     void SetBalance(TInt aBalance) override;
     void SetFade(TInt aFade) override;
@@ -167,6 +167,11 @@ VolumeControl::VolumeControl(TBool aDisableVolume, const TChar* aCard, const std
 
 VolumeControl::~VolumeControl()
 {}
+
+TBool VolumeControl::IsVolumeSupported() const
+{
+    return impl != nullptr && impl->IsVolumeSupported();
+}
 
 void VolumeControl::SetVolumeFixed(TUint aVolume)
 {
