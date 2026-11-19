@@ -11,9 +11,19 @@ TARG_ARCH  = aarch64-scarthgap-linux
 BUILD_TYPE = Release
 OBJ_DIR    = $(OSPLATFORM)/objs
 
+
+KFR_DIR       ?= ../dependencies/$(TARG_ARCH)/kfr
+CAPTURE_ALSA  ?= 1
+
+BUILD_FLAGS = -std=c++20 -fstack-protector -fstack-check -DDEFINE_LITTLE_ENDIAN -fpermissive -DENABLE_KFR_DSP
+ifeq ($(BUILD_TYPE), Release)
+	BUILD_FLAGS += -O3 -march=native -ffast-math -fno-finite-math-only -DNDEBUG
+else
+	BUILD_FLAGS += -Og -g -gdwarf-4 -Wall -Wextra -DDEBUG
+endif
+
 # Core Compiler Optimization and Assembly Flags
-CFLAGS = -c -Wall -std=c++17 -O0 -g -MMD -MP -DTARG_ARCH=$(TARG_ARCH) \
-         -fstack-protector -fstack-check -DDEFINE_LITTLE_ENDIAN -fpermissive \
+CFLAGS = -c $(BUILD_FLAGS) -DTARG_ARCH=$(TARG_ARCH) \
          $(shell pkg-config --cflags glib-2.0)
 
 # Native Installation Path Configurations
@@ -34,31 +44,40 @@ LIBS = $(shell pkg-config --libs glib-2.0) \
        -lCodecAiffBase -lCodecVorbis -llibOgg -lCodecFlac -lCodecWav \
        -lCodecDsdDsf -lCodecDsdDff -lCodecDsdRaw -lSourceRaop -lohPipeline \
        -lCodecAacFdkAdts -lCodecAacFdkBase -lCodecMp3 -lCodecAacFdkMp4 -lCodecAacFdk \
+       -lkfr_dft -lkfr_dsp \
        -lpthread -lasound -ldl -lm -lOdp -lssl -lcrypto
 
 # Static Search Path Directories
 DEPS_DIR = ../dependencies/$(TARG_ARCH)
-INCLUDES = -I. -Iradio \
+INCLUDES = -I. -Iradio -Isorx \
            -I$(DEPS_DIR)/ohMediaPlayer/include \
            -I$(DEPS_DIR)/ohNetmon/include \
-           -I$(DEPS_DIR)/ohNetGenerated-$(TARG_ARCH)-$(BUILD_TYPE)/include/ohnet/OpenHome/Net/Core \
+           -I$(DEPS_DIR)/ohNetGenerated \
            -I$(DEPS_DIR)/ohNet/include/ohnet \
-           -I$(DEPS_DIR)
+           -I$(DEPS_DIR) \
+           -I$(KFR_DIR)/include
 
 LDFLAGS  = -L$(DEPS_DIR)/ohMediaPlayer/lib \
            -L$(DEPS_DIR)/ohNetmon/lib \
            -L$(DEPS_DIR)/ohNet/lib \
-           -L$(DEPS_DIR)/ohNetGenerated-$(TARG_ARCH)-$(BUILD_TYPE)/lib
+           -L$(DEPS_DIR)/ohNetGenerated/lib \
+           -L$(KFR_DIR)/lib
 
 # Workspace Source Track Aggregations
-# Sources at the top level and in subdirectories (e.g. radio/).
-# The ContentDirectory / ConnectionManager device providers from the ohNetGenerated
-# sources are compiled here because the prebuilt ohNetGenerated library only
-# ships the device providers used by ohPipeline (no UPnP MediaServer support).
+SOURCES  = $(filter-out SoxrProcessor.cpp KfrDspProcessor.cpp KfrDspFilter.cpp KfrDspFilterImpl.cpp, $(wildcard *.cpp))
+SOURCES += sorx/ConvertBELE.cpp
+ifeq ($(CAPTURE_ALSA),1)
+BUILD_FLAGS += -DCAPTURE_ALSA=1
+SOURCES += $(wildcard capture/*.cpp)
+endif
+SOURCES += $(wildcard LinnAmp/*.cpp)
+SOURCES += $(wildcard ConfigUI/*.cpp)
+SOURCES += $(wildcard radio/*.cpp)
 OHNG_PROVIDER_DIR = $(DEPS_DIR)/Generated
-OHNG_PROVIDERS = DvUpnpOrgContentDirectory1 DvUpnpOrgConnectionManager1
-SRCS     = $(wildcard *.cpp) $(wildcard radio/*.cpp) $(wildcard LinnAmp/*.cpp) $(wildcard ConfigUI/*.cpp) $(addsuffix .cpp,$(addprefix $(OHNG_PROVIDER_DIR)/,$(OHNG_PROVIDERS)))
-OBJECTS  = $(patsubst %.cpp, $(OBJ_DIR)/%.o, $(notdir $(SRCS)))
+SOURCES += $(OHNG_PROVIDER_DIR)/DvUpnpOrgContentDirectory1.cpp
+SOURCES += $(OHNG_PROVIDER_DIR)/DvUpnpOrgConnectionManager1.cpp
+OBJECTS  = $(patsubst %.cpp, $(OBJ_DIR)/%.o, $(SOURCES))
+HEADERS  = $(wildcard *.h capture/*.h)
 
 # ============================================================================
 # Compilation Build Automation Targets
@@ -114,8 +133,7 @@ $(OBJ_DIR)/%.o: %.cpp
 $(TARGET): $(OBJECTS)
 	$(CXX) -Wall $(LDFLAGS) -Wl,--start-group $(OBJECTS) $(LIBS) -Wl,--end-group -o $@
 
-build:
-	@mkdir -p $(OBJ_DIR)
+build: ; @mkdir -p $(OBJ_DIR)/capture
 
 clean:
 	rm -rf $(OSPLATFORM)/objs

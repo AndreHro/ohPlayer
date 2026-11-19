@@ -1,84 +1,176 @@
-#include "OhLog.h"
+#include "VolumeControl.h"
+
 #include <OpenHome/Media/Pipeline/Msg.h>
 #include <OpenHome/Av/VolumeManager.h>
 #include <OpenHome/Private/Printer.h>
 
 #include <alsa/asoundlib.h>
 #include <math.h>
-#include <OpenHome/Private/Printer.h>
-#include "VolumeControl.h"
 
-using namespace OpenHome;
-using namespace OpenHome::Av;
+
+namespace OpenHome {
+namespace Av {
 using namespace OpenHome::Media;
 
-VolumeControl::VolumeControl()
-: iHandle(NULL)
-, iElem(NULL)
+class VolumeControl::VolumeControlPimpl : public IVolume, public IBalance, public IFade
 {
-    const TChar *CARD          = "default";
-    const TChar *SELEM_NAMES[] = {"Digital", "PCM", "Master"};
-    // Get the mixer element for the default sound card.
-    if (snd_mixer_open(&iHandle, 0) < 0) {
-        iHandle = NULL;
-        OhLog::PrintError("VolumeControl: snd_mixer_open failed\n");
-        return;
-    }
-    if (snd_mixer_attach(iHandle, CARD) < 0) {
-        OhLog::PrintError("VolumeControl: snd_mixer_attach(%s) failed\n", CARD);
-        snd_mixer_close(iHandle);
-        iHandle = NULL;
-        return;
-    }
-    if (snd_mixer_selem_register(iHandle, NULL, NULL) < 0 ||
-        snd_mixer_load(iHandle) < 0) {
-        OhLog::PrintError("VolumeControl: failed to load ALSA mixer elements\n");
-        snd_mixer_close(iHandle);
-        iHandle = NULL;
-        return;
-    }
-    // Get the mixer element for the most relevant control.
-    snd_mixer_selem_id_t *iSid;
+public:
+    VolumeControlPimpl(const TChar* aCard, const std::vector<Brn>& aMixerNames);
+    ~VolumeControlPimpl();
 
+    TBool IsVolumeSupported() const { return iElem != nullptr; }
+    void SetVolume(TUint aVolume) override;
+    void SetBalance(TInt aBalance) override;
+    void SetFade(TInt aFade) override;
+
+private:
+    void UpdateHardwareChannels();
+    long VolumeToAlsaValue(double aVolumeNormalized);
+
+    snd_mixer_t      *iHandle{nullptr}; 
+    snd_mixer_elem_t *iElem{nullptr};   
+    TUint             iCurrentVolume{0}; // 0 to 100000+ millidB
+    TInt              iCurrentBalance{0}; // Usually scaled negative to positive
+    TInt              iCurrentFade{0};    // Usually scaled negative to positive
+};
+
+VolumeControl::VolumeControlPimpl::VolumeControlPimpl(const TChar* aCard, const std::vector<Brn>& aMixerNames)
+{
+    Log::Print("Initializing ALSA Volume Mixer on card: %s\n", aCard);
+    
+    if (snd_mixer_open(&iHandle, 0) < 0) return;
+    
+    if (snd_mixer_attach(iHandle, aCard) < 0 ||
+        snd_mixer_selem_register(iHandle, NULL, NULL) < 0 ||
+        snd_mixer_load(iHandle) < 0) 
+    {
+        snd_mixer_close(iHandle);
+        iHandle = nullptr;
+        return;
+    }
+
+    snd_mixer_selem_id_t *iSid;
     snd_mixer_selem_id_alloca(&iSid);
     snd_mixer_selem_id_set_index(iSid, 0);
 
-    int nelems = sizeof(SELEM_NAMES)/sizeof(TChar*);
-
-    for (int i=0; i<nelems; i++)
+    for (const auto& name : aMixerNames)
     {
-        snd_mixer_selem_id_set_name(iSid, SELEM_NAMES[i]);
+        Brhz devName(name);
 
+        snd_mixer_selem_id_set_name(iSid, devName.CString());
         iElem = snd_mixer_find_selem(iHandle, iSid);
-
-        // Quit the loop if control found.
-        if (iElem != NULL)
-        {
+        if (iElem != nullptr) {
+            Log::Print("VolumeControl: Found working mixer element: %s\n", devName.CString());
             break;
         }
     }
-    if (iElem != NULL) {
-        if (snd_mixer_selem_has_playback_switch(iElem)) {
-            OhLog::Print("VolumeControl: unmuting playback switch\n");
-            snd_mixer_selem_set_playback_switch_all(iElem, 1);
-        }
-    } else {
-        // No volume control on this sound card: output runs at full scale.
-        OhLog::PrintWarning("VolumeControl: no ALSA volume control found - output at full scale\n");
+    
+    if (iElem == nullptr) {
+        Log::Print("VolumeControl: Warning - No matching hardware mixer control found!\n");
     }
-
 }
 
-VolumeControl::~VolumeControl()
+VolumeControl::VolumeControlPimpl::~VolumeControlPimpl()
 {
-    if (iHandle != NULL) {
+    if (iHandle) {
         snd_mixer_close(iHandle);
     }
 }
 
-TBool VolumeControl::IsVolumeSupported()
+long VolumeControl::VolumeControlPimpl::VolumeToAlsaValue(double aVolumeNormalized)
 {
-    return (iElem != NULL);
+    long min, max;
+    TInt err = snd_mixer_selem_get_playback_dB_range(iElem, &min, &max);
+
+    if (err < 0 || min >= max) {
+        snd_mixer_selem_get_playback_volume_range(iElem, &min, &max);
+        return lrint(floor(aVolumeNormalized * (max - min))) + min;
+    }
+
+    // Standard linear scale handling if narrow dB range
+    if (max - min <= 2400) {
+        return lrint(floor(aVolumeNormalized * (max - min))) + min;
+    }
+
+    // Logarithmic curve matching human ear perception
+    if (min != SND_CTL_TLV_DB_GAIN_MUTE) {
+        double min_norm = std::pow(10.0, (min - max) / 6000.0);
+        aVolumeNormalized = aVolumeNormalized * (1 - min_norm) + min_norm;
+    }
+    return lrint(floor(6000.0 * log10(aVolumeNormalized))) + max;
+}
+
+void VolumeControl::VolumeControlPimpl::UpdateHardwareChannels()
+{
+    if (!IsVolumeSupported()) return;
+
+    // Convert raw OpenHome milli-dB steps down to basic percentage scaling (0.0 to 1.0)
+    double baseVolume = double((iCurrentVolume / 1024) / 100.0f);
+    if (baseVolume > 1.0) baseVolume = 1.0;
+
+    // Handle Balance Modifications (Assuming standard -10 to +10 range from OpenHome)
+    double leftScaler = 1.0;
+    double rightScaler = 1.0;
+    if (iCurrentBalance > 0) leftScaler  -= (iCurrentBalance / 10.0);
+    if (iCurrentBalance < 0) rightScaler -= (abs(iCurrentBalance) / 10.0);
+
+    // Handle Fade Modifications (Assuming standard -10 to +10 range, Front vs Rear)
+    double frontScaler = 1.0;
+    double rearScaler = 1.0;
+    if (iCurrentFade > 0) rearScaler  -= (iCurrentFade / 10.0);
+    if (iCurrentFade < 0) frontScaler -= (abs(iCurrentFade) / 10.0);
+
+    // Final channel volume mixing calculations
+    long leftFrontVal  = VolumeToAlsaValue(baseVolume * leftScaler * frontScaler);
+    long rightFrontVal = VolumeToAlsaValue(baseVolume * rightScaler * frontScaler);
+    long leftRearVal   = VolumeToAlsaValue(baseVolume * leftScaler * rearScaler);
+    long rightRearVal  = VolumeToAlsaValue(baseVolume * rightScaler * rearScaler);
+
+    // Commit parameters safely back to ALSA hardware registers
+    snd_mixer_selem_set_playback_volume(iElem, SND_MIXER_SCHN_FRONT_LEFT, leftFrontVal);
+    snd_mixer_selem_set_playback_volume(iElem, SND_MIXER_SCHN_FRONT_RIGHT, rightFrontVal);
+    
+    // Future-proofing for multi-channel/surround expansion
+    if (snd_mixer_selem_has_playback_channel(iElem, SND_MIXER_SCHN_REAR_LEFT)) {
+        snd_mixer_selem_set_playback_volume(iElem, SND_MIXER_SCHN_REAR_LEFT, leftRearVal);
+        snd_mixer_selem_set_playback_volume(iElem, SND_MIXER_SCHN_REAR_RIGHT, rightRearVal);
+    }
+}
+
+void VolumeControl::VolumeControlPimpl::SetVolume(TUint aVolume)
+{
+    iCurrentVolume = aVolume;
+    UpdateHardwareChannels();
+}
+
+void VolumeControl::VolumeControlPimpl::SetBalance(TInt aBalance)
+{
+    iCurrentBalance = aBalance;
+    UpdateHardwareChannels();
+}
+
+void VolumeControl::VolumeControlPimpl::SetFade(TInt aFade)
+{
+    iCurrentFade = aFade;
+    UpdateHardwareChannels();
+}
+
+VolumeControl::VolumeControl(TBool aDisableVolume, const TChar* aCard, const std::vector<Brn>& aMixerNames)
+: iVolumeDisabled(aDisableVolume)
+{
+    if (iVolumeDisabled) {
+        Log::Print("VolumeControl: Software volume disabled via configuration.\n");
+        return; 
+    }
+    impl = std::make_unique<VolumeControlPimpl>(aCard, aMixerNames);
+}
+
+VolumeControl::~VolumeControl()
+{}
+
+TBool VolumeControl::IsVolumeSupported() const
+{
+    return impl != nullptr && impl->IsVolumeSupported();
 }
 
 void VolumeControl::SetVolumeFixed(TUint aVolume)
@@ -88,65 +180,20 @@ void VolumeControl::SetVolumeFixed(TUint aVolume)
 
 void VolumeControl::SetVolume(TUint aVolume)
 {
-    const long  MAX_LINEAR_DB_SCALE = 24;
-    const TUint MILLI_DB_PER_STEP   = 1024;
-    double      volume;
-    double      min_norm;
-    long        min, max, value;
-    TInt        err;
-
-    // Sanity Check
-    if (! IsVolumeSupported())
-    {
-        return;
-    }
-    OhLog::PrintDebug("VolumeControl: set volume %u\n", aVolume);
-    volume = double((aVolume / MILLI_DB_PER_STEP)/100.0f);
-
-    // Use the dB range to map the volume to a scale more in tune
-    // with the human ear, if possible.
-    err = snd_mixer_selem_get_playback_dB_range(iElem, &min, &max);
-
-    if (err < 0 || min >= max) {
-        // dB range not available, use a linear volume mapping.
-        err = snd_mixer_selem_get_playback_volume_range(iElem, &min, &max);
-        if (err < 0)
-        {
-            OhLog::PrintError("VolumeControl: failed to get playback volume range\n");
-            return;
-        }
-
-        value = lrint(floor(volume * (max - min))) + min;
-        snd_mixer_selem_set_playback_volume_all(iElem, value);
-
-        return;
-    }
-
-    if (max - min <= MAX_LINEAR_DB_SCALE * 100)
-    {
-        // dB range less than 24 dB, use a linear mapping
-        value = lrint(floor(volume * (max - min))) + min;
-        snd_mixer_selem_set_playback_dB_all(iElem, value, -1);
-        return;
-    }
-
-    if (min != SND_CTL_TLV_DB_GAIN_MUTE) {
-        min_norm = exp10((min - max) / 6000.0);
-        volume = volume * (1 - min_norm) + min_norm;
-    }
-    value = lrint(floor(6000.0 * log10(volume))) + max;
-    snd_mixer_selem_set_playback_switch_all(iElem, 1);
-    snd_mixer_selem_set_playback_dB_all(iElem, value, -1);
-
-    return;
+    if (iVolumeDisabled || !impl) return;
+    impl->SetVolume(aVolume);
 }
 
-void VolumeControl::SetBalance(TInt /*aBalance*/)
+void VolumeControl::SetBalance(TInt aBalance)
 {
-    // Not Implemented
+    if (iVolumeDisabled || !impl) return;
+    impl->SetBalance(aBalance);
 }
 
-void VolumeControl::SetFade(TInt /*aFade*/)
+void VolumeControl::SetFade(TInt aFade)
 {
-    // Not Implemented
+    if (iVolumeDisabled || !impl) return;
+    impl->SetFade(aFade);
+}
+}
 }

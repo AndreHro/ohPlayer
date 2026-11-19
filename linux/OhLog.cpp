@@ -81,13 +81,15 @@ TInt OhLog::PrintError(const TChar* aFormat, ...)
     if (!Debug::TestLevel(kLevel)) {
         return 0;
     }
+    TInt ret;
     va_list arg;
-    va_start(arg, aFormat);
-    Log::Print("%s", AC_RED);
-    TInt ret = PrintWithContextVA(kLevel, Debug::kSeverityError, aFormat, arg);
-    Log::Print("%s", AC_NORMAL);
-    va_end(arg);
-    return ret;
+    va_start(arg,aFormat);
+
+   Log::Print("%s", AC_RED);
+    ret = Log::PrintVA(aFormat, arg);
+   Log::Print("%s", AC_NORMAL);
+   va_end(arg);
+   return (ret);
 }
 
 TInt OhLog::PrintWarning(const TChar* aFormat, ...)
@@ -95,11 +97,13 @@ TInt OhLog::PrintWarning(const TChar* aFormat, ...)
     if (!Debug::TestLevel(kLevel)) {
         return 0;
     }
+    TInt ret;
     va_list arg;
-    va_start(arg, aFormat);
-    Log::Print("%s", AC_YELLOW);
-    TInt ret = PrintWithContextVA(kLevel, Debug::kSeverityWarning, aFormat, arg);
-    Log::Print("%s", AC_NORMAL);
-    va_end(arg);
-    return ret;
+    va_start(arg,aFormat);
+
+   Log::Print("%s", AC_YELLOW);
+    ret = Log::PrintVA(aFormat, arg);
+   Log::Print("%s", AC_NORMAL);
+   va_end(arg);
+   return (ret);
 }

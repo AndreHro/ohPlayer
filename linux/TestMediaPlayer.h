@@ -39,6 +39,10 @@
 #include <OpenHome/FsFlushPeriodic.h>
 #include "DriverAlsa.h"
 
+#ifdef CAPTURE_ALSA
+#include "capture/SourceAlsaCapture.h"
+#endif
+
 #include <memory>
 
 namespace OpenHome {
@@ -183,7 +187,7 @@ private:
 public:
     TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack, const Brx& aUdn, const TChar* aRoom, const TChar* aProductName,
                     const Brx& aTuneInPartnerId, const Brx& aTidalId, const Brx& aQobuzIdSecret, const Brx& aUserAgent,
-                    const TChar* aStoreFile, TUint aOdpPort=0, TUint aWebUiPort=0, TBool aEnableRadioBrowser=false,
+                    const TChar* aStoreFile, const Brx& aKFRConfigDir, TUint aOdpPort=0, TUint aWebUiPort=0, TBool aEnableRadioBrowser=false,
                     TUint aMinWebUiResourceThreads=kMinWebUiResourceThreads, TUint aMaxWebUiTabs=kMaxWebUiTabs, TUint aUiSendQueueSize=kUiSendQueueSize, TUint aUiMsgBufCount=kUiMsgBufCount, TUint aUiMsgBufBytes=kUiMsgBufBytes );
     virtual ~TestMediaPlayer();
     void RequestExit();
@@ -254,8 +258,7 @@ private:
     const Brh iUserAgent;
     IOhmTimestamper* iTxTimestamper;
     IOhmTimestamper* iRxTimestamper;
-    //VolumeSinkLogger iVolumeLogger;
-    VolumeControl    iVolumeLogger;
+    std::unique_ptr<VolumeControl> iVolumeCtrl;
     VolumeSinkLogger iVolumeSinkLogger;
     std::unique_ptr<Media::AudioTimeCpu> iAudioTime;
     Bws<Uri::kMaxUriBytes+1> iPresentationUrl;
@@ -275,13 +278,13 @@ private:
     TUint iUiSendQueueSize;
     TUint iUiMsgBufCount;
     TUint iUiMsgBufBytes;
-    OhLinnAmpVolume* iLinnAmpVolume;
+
+    std::unique_ptr<OhLinnAmpVolume> iLinnAmpVolume;
     std::unique_ptr<LinnAmpConfig> iLinnAmpConfig;
     std::unique_ptr<PipelineConfig> iPipelineConfig;
     std::unique_ptr<RadioPresetsStatic> iRadioPresetsStatic;
     std::unique_ptr<Av::RadioBrowserMediaServer> iRadioBrowserMediaServer;
-
-    std::unique_ptr<OpenHome::Media::DriverAlsa> iDriver;
+    std::unique_ptr<OpenHome::Media::PipelineDriverBase> iDriver;
     std::unique_ptr<Media::IPipelineObserver>    iRaspdacObserver;
     std::unique_ptr<IVolumeObserver>         iRaspdacVolumeObserver;
 };
@@ -304,6 +307,7 @@ public:
     const TestFramework::OptionString& UserAgent() const;
     const TestFramework::OptionBool& ClockPull() const;
     const TestFramework::OptionString& StoreFile() const;
+    const TestFramework::OptionString& KfrConfigDir() const;
     const TestFramework::OptionUint& OptionOdp() const;
     const TestFramework::OptionUint& OptionWebUi() const;
     const TestFramework::OptionUint& Shell() const;
@@ -323,6 +327,7 @@ private:
     TestFramework::OptionString iOptionUserAgent;
     TestFramework::OptionBool iOptionClockPull;
     TestFramework::OptionString iOptionStoreFile;
+    TestFramework::OptionString iOptionKfrConfigDir;
     TestFramework::OptionUint iOptionOdp;
     TestFramework::OptionUint iOptionWebUi;
     TestFramework::OptionUint iOptionShell;

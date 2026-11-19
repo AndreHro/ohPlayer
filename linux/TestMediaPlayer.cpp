@@ -48,6 +48,11 @@
 #include <OpenHome/Private/Debug.h>
 #include "DriverAlsa.h"
 
+#if CAPTURE_ALSA
+#include "capture/SourceAlsaCapture.h"
+#include "capture/ProtocolAlsaCapture.h"
+#endif
+
 #include <vector>
 
 #undef LPEC_ENABLE
@@ -224,7 +229,7 @@ const TUint TestMediaPlayer::kDsdPadBytesPerChunk;
 
 TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack, const Brx& aUdn, const TChar* aRoom, const TChar* aProductName,
                                  const Brx& aTuneInPartnerId, const Brx& aTidalId, const Brx& aQobuzIdSecret, const Brx& aUserAgent,
-                                 const TChar* aStoreFile, TUint aOdpPort, TUint aWebUiPort, TBool aEnableRadioBrowser,
+                                 const TChar* aStoreFile, const Brx& aKFRConfigDir, TUint aOdpPort, TUint aWebUiPort, TBool aEnableRadioBrowser,
                                  TUint aMinWebUiResourceThreads, TUint aMaxWebUiTabs, TUint aUiSendQueueSize,
                                  TUint aUiMsgBufCount, TUint aUiMsgBufBytes)
     : iPullableClock(nullptr)
@@ -322,9 +327,13 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
     iDeviceUpnpAv->SetAttribute("Lpec.Name", "MediaRenderer");
 #endif
     iDeviceUpnpAv->SetAttribute("Odp.Name", "MediaRenderer");
-
+    
     VolumeProfile volumeProfile;
     VolumeConsumer volumeInit;
+    const TChar* alsaCardString = "default";
+    const std::vector<Brn> mixerList{Brn("Digital"), Brn("PCM"), Brn("Master"),
+                                     Brn("Speaker"), Brn("DAC"), Brn("Analogue")};
+    iVolumeCtrl = std::make_unique<VolumeControl>(false, alsaCardString, mixerList);
 
     // Read Linn Amp settings from the config store (web config)
     Bws<LinnAmpConfig::kMaxSerialPortBytes> serialPortBuf;
@@ -350,11 +359,11 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
         std::string serialPortStr(reinterpret_cast<const char*>(serialPortBuf.Ptr()), serialPortBuf.Bytes());
         const TUint volumeLimit = LinnAmpConfig::ReadVolumeLimitFromStore(*iConfigRamStore, 100);
         const TInt listenSource = LinnAmpConfig::ReadSourceFromStore(*iConfigRamStore, LinnAmpConfig::kSourceMin);
-        iLinnAmpVolume = new OhLinnAmpVolume(serialPortStr, volumeLimit, static_cast<TUint>(listenSource));
+        iLinnAmpVolume = std::make_unique<OhLinnAmpVolume>(serialPortStr, volumeLimit, static_cast<TUint>(listenSource));
         if (iLinnAmpVolume->IsVolumeSupported()) {
             // Set the ALSA output level: attenuation is handled by the Linn amp
             const TUint alsaVolume = LinnAmpConfig::ReadAlsaVolumeFromStore(*iConfigRamStore, 100);
-            iVolumeLogger.SetVolumeFixed(alsaVolume * 1024);
+            iVolumeCtrl->SetVolumeFixed(alsaVolume * 1024);
             volumeInit.SetVolume(*iLinnAmpVolume);
             volumeInit.SetBalance(*iLinnAmpVolume);
             volumeInit.SetFade(*iLinnAmpVolume);
@@ -366,8 +375,7 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
             linnAmpUsed = true;
             OhLog::Print("Using Linn Amp volume control on %s\n", serialPortStr.c_str());
         } else {
-            delete iLinnAmpVolume;
-            iLinnAmpVolume = nullptr;
+            iLinnAmpVolume.reset();
             // No amplifier detected: grey out the volume in control points.
             // Volume.Enabled already reads No, so the greyed-out state is
             // announced and persists to the next start.
@@ -378,10 +386,10 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
         }
     } else if (volumeEnabled) {
         // Internal volume control: use the ALSA mixer.
-        if (iVolumeLogger.IsVolumeSupported()) {
-            volumeInit.SetVolume(iVolumeLogger);
-            volumeInit.SetBalance(iVolumeLogger);
-            volumeInit.SetFade(iVolumeLogger);
+        if (iVolumeCtrl->IsVolumeSupported()) {
+            volumeInit.SetVolume(*iVolumeCtrl);
+            volumeInit.SetBalance(*iVolumeCtrl);
+            volumeInit.SetFade(*iVolumeCtrl);
         } else {
             // No mixer on the sound card: no volume control at all.
             // Grey out the volume in control points by disabling Volume.Enabled
@@ -447,7 +455,7 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
                                    mediaPlayerStore, pipelineInit, *iAudioTime,
                                    volumeInit, volumeProfile,
                                    *iInfoLogger,
-                                   udn, mpInit);
+                                   aUdn, mpInit);
     delete mpInit;
 
     // Radio Browser media server: exposes the community radio directory
@@ -503,9 +511,10 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
     // Run()). The provider itself is registered with MediaPlayer's
     // RadioPresets in InitialiseSubsystems, after the Radio source is added.
     iRadioPresetsStatic = std::make_unique<RadioPresetsStatic>(iMediaPlayer->ConfigInitialiser());
-    
+ 
     iDriver = std::make_unique<DriverAlsa>(iMediaPlayer->Pipeline(),
-                                           PipelineConfig::ReadAlsaBufferUsFromStore(*iConfigRamStore));
+                                           PipelineConfig::ReadAlsaBufferUsFromStore(*iConfigRamStore),
+                                           0, aKFRConfigDir);
 #if 1
     if (iDriver == NULL)
     {
@@ -551,11 +560,6 @@ TestMediaPlayer::~TestMediaPlayer()
 {
     if (iDevice) {
         ASSERT(!iDevice->Enabled());
-    }
-
-    // Clean up Linn Amp volume control
-    if (iLinnAmpVolume != nullptr) {
-        delete iLinnAmpVolume;
     }
 
     // 2. Clean up dependencies before iStoreFileWriter and iConfigRamStore drop
@@ -768,6 +772,15 @@ void TestMediaPlayer::RegisterPlugins(Environment& aEnv)
 
         iMediaPlayer->Add(ProtocolFactory::NewTidal(ssl, clientId, clientSecret, apps, *iMediaPlayer));
     }
+# ifdef CAPTURE_ALSA
+    Media::ProtocolAlsaCapture::DevParam devParam{
+        .iDevName = Bws<64>("plughw:1,0"),
+        .iSampleRate = 48000,
+        .iChannels = 2
+    };
+    iMediaPlayer->Add(new Media::ProtocolAlsaCapture(devParam, aEnv));
+#endif
+
     // ...likewise, only add Qobuz if we have ids for login
     if (iQobuzIdSecret.Bytes() > 0) {
         Parser p(iQobuzIdSecret);
@@ -844,6 +857,11 @@ void TestMediaPlayer::RegisterPlugins(Environment& aEnv)
 #else
     iMediaPlayer->Add(SourceFactory::NewScd(*iMediaPlayer, nullptr));
 #endif
+
+#ifdef CAPTURE_ALSA
+    iMediaPlayer->Add(new AlsaCapture::SourceAlsaCapture(*iMediaPlayer));
+#endif
+
 }
 
 void TestMediaPlayer::InitialiseSubsystems()
