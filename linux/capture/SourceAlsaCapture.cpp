@@ -20,7 +20,7 @@ namespace OpenHome {
 namespace AlsaCapture {
 
 const Brn SourceAlsaCapture::kSourceNameAlsaCapture("AlsaCapture");
-const TChar* SourceAlsaCapture::kSourceTypeAlsaCapture = "AlsaCapture";
+const TChar* SourceAlsaCapture::kSourceTypeAlsaCapture = "Digital";
 const bool SourceAlsaCapture::kDefaultVisibility = true; 
 
 SourceAlsaCapture::SourceAlsaCapture(Av::IMediaPlayer& aMediaPlayer)
@@ -29,6 +29,7 @@ SourceAlsaCapture::SourceAlsaCapture(Av::IMediaPlayer& aMediaPlayer)
              aMediaPlayer.Pipeline(),
              kDefaultVisibility)
     , iConnected(true)
+    , iStopped(true)
     , iUriProvider(nullptr)
 {
     auto& trackFactory = aMediaPlayer.TrackFactory();
@@ -36,11 +37,11 @@ SourceAlsaCapture::SourceAlsaCapture(Av::IMediaPlayer& aMediaPlayer)
     try {
         iUriProvider = new UriProviderAlsaCapture(trackFactory);
         iUriProvider->SetTransportPlay(MakeFunctor(*this, &SourceAlsaCapture::Play));
-        aMediaPlayer.Add(iUriProvider); // Media player takes absolute ownership
+        iUriProvider->SetTransportPause(MakeFunctor(*this, &SourceAlsaCapture::Pause));
+        iUriProvider->SetTransportStop(MakeFunctor(*this, &SourceAlsaCapture::Stop));
+        aMediaPlayer.Add(iUriProvider);
     }
     catch (...) {
-        // If UriProvider registration fails, iUriProvider was never safely stored 
-        // down inside the mediaPlayer context, so we must clean it up locally.
         delete iUriProvider;
         iUriProvider = nullptr;
         throw;
@@ -61,8 +62,9 @@ void SourceAlsaCapture::Activate(TBool /*aAutoPlay*/, TBool /*aPrefetchAllowed*/
     iPipeline.RemoveAll();
 
     iPipeline.Begin(iUriProvider->Mode(), iUriProvider->CurrentTrackId());
+    iStopped.store(false);
 
-    Play();
+    iPipeline.Play();
 }
 
 TBool SourceAlsaCapture::TryActivateNoPrefetch(const Brx& aMode)
@@ -74,17 +76,44 @@ TBool SourceAlsaCapture::TryActivateNoPrefetch(const Brx& aMode)
     return true;
 }
 
-void SourceAlsaCapture::PipelineStopped() {}
+
+void SourceAlsaCapture::PipelineStopped()
+{
+    iStopped.store(true);
+}
 
 void SourceAlsaCapture::StandbyEnabled()
 {
-    iPipeline.Stop();
+    Stop();
 }
 
 void SourceAlsaCapture::Play()
 {
-    if (iConnected.load()) {
-        iPipeline.Play();
+    if (!iConnected.load()) {
+        return;
+    }
+    if (iStopped.load()) {
+        iUriProvider->Reset();
+        iUriProvider->MoveTo(Brn("uri=alsacapture://default"));
+        iPipeline.RemoveAll();
+        iPipeline.Begin(iUriProvider->Mode(), iUriProvider->CurrentTrackId());
+        iStopped.store(false);
+    }
+    iPipeline.Play();
+}
+
+void SourceAlsaCapture::Pause()
+{
+    if (IsActive() && !iStopped.load()) {
+        iPipeline.Pause();
+    }
+}
+
+void SourceAlsaCapture::Stop()
+{
+    if (IsActive()) {
+        iStopped.store(true);
+        iPipeline.Stop();
     }
 }
 

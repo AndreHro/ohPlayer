@@ -13,7 +13,7 @@ const Brn UriProviderAlsaCapture::kCommandUri("uri");
 UriProviderAlsaCapture::UriProviderAlsaCapture(TrackFactory& aTrackFactory)
     : UriProvider("ALSA_CAPTURE",
                   Latency::Internal,
-                  Pause::NotSupported,
+                  Pause::Supported,
                   Next::NotSupported,
                   Prev::NotSupported,
                   Repeat::NotSupported,

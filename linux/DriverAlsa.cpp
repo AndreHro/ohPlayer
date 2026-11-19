@@ -588,21 +588,23 @@ TBool DriverAlsaPimpl::TryProfile(Profile& aProfile,
         return false;
     }
 
-    const uint64_t requestedBufferFrames =
+    const uint64_t requestedFrames =
         (static_cast<uint64_t>(aBufferUs) * aSampleRate + 999999) / 1000000;
-    const snd_pcm_uframes_t minimumBufferFrames = iLowLatencyMode ? 4096 : 8192;
-    snd_pcm_uframes_t bufferSize = iLowLatencyMode
-        ? minimumBufferFrames
-        : std::max<snd_pcm_uframes_t>(
-              minimumBufferFrames,
-              static_cast<snd_pcm_uframes_t>(requestedBufferFrames));
-    snd_pcm_uframes_t periodSize = 1024;
+    const snd_pcm_uframes_t requestedBufferFrames =
+        static_cast<snd_pcm_uframes_t>(std::max<uint64_t>(1, requestedFrames));
+    snd_pcm_uframes_t periodSize = iLowLatencyMode
+        ? std::max<snd_pcm_uframes_t>(1, requestedBufferFrames / 4)
+        : 1024;
     err = snd_pcm_hw_params_set_period_size_near(iHandle,
                                                  hwParams,
                                                  &periodSize,
                                                  nullptr);
     if (err < 0) return fail("snd_pcm_hw_params_set_period_size_near", err);
 
+    const snd_pcm_uframes_t minimumBufferFrames = iLowLatencyMode
+        ? 2 * periodSize
+        : 8192;
+    snd_pcm_uframes_t bufferSize = std::max(minimumBufferFrames, requestedBufferFrames);
     err = snd_pcm_hw_params_set_buffer_size_near(iHandle,
                                                  hwParams,
                                                  &bufferSize);
@@ -863,4 +865,3 @@ Msg* PipelineDriverBase::ProcessMsg(MsgDrain* aMsg)
 
     return aMsg;
 }
-
