@@ -49,11 +49,12 @@ public:
     static const TUint kMaxAlsaBufferUs = 50000;
     static const TUint kDefaultAlsaBufferUs = 12052;
 
-    // Defaults = the values previously used by the code:
-    //  - StarvationRamperMinSize was explicitly set to 100 ms in TestMediaPlayer.cpp.
+    // Defaults:
+    //  - StarvationRamperMinSize is 25 ms, leaving modest scheduling headroom
+    //    while limiting downstream latency.
     //  - EncodedReservoirSize was left at the ohPipeline default
     //    (PipelineInitParams::kEncodedReservoirSizeBytes = 1536 * 1024 bytes).
-    static const TUint kDefaultStarvationRamperJiffies = Media::Jiffies::kPerMs * 100;
+    static const TUint kDefaultStarvationRamperJiffies = Media::Jiffies::kPerMs * 25;
     static const TUint kDefaultEncodedReservoirBytes  = 1536 * 1024;
 
     // Registers the web config parameters with the MediaPlayer's ConfigManager.

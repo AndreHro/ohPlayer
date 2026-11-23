@@ -22,9 +22,12 @@ private: // from ISource
 
 private:
     void Play();
+    void Stop();
+    void Pause();
 
 private:
     std::atomic<bool>       iConnected;
+    std::atomic<bool>       iStopped;
     UriProviderAlsaCapture* iUriProvider;
    
 

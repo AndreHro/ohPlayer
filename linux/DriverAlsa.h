@@ -7,7 +7,6 @@
 #include <OpenHome/Private/Thread.h>
 
 
-
 namespace OpenHome {
 namespace Media {
 

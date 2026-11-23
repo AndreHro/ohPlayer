@@ -506,7 +506,7 @@ KfrPcmProcessor::KfrPcmProcPimpl::KfrPcmProcPimpl(
         const auto rawIrs = GetRawIrs(dir, iSpec.iLowLatency);
         if (rawIrs->hasLeft) {
             const uint32_t irRate = rawIrs->left.sampleRate;
-            if (irRate == iOutputRate) {
+            if (iSpec.iLowLatency || irRate == iOutputRate) {
                 iFirBeforeSrc = false;
             }
             else if (irRate == iInputRate) {
