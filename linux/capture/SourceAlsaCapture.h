@@ -16,6 +16,7 @@ public:
 
 private: // from ISource
     void Activate(TBool aAutoPlay, TBool aPrefetchAllowed) override;
+    void Deactivate() override;
     TBool TryActivateNoPrefetch(const Brx& aMode) override;
     void PipelineStopped() override;
     void StandbyEnabled() override;

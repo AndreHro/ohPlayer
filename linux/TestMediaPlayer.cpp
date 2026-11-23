@@ -330,10 +330,12 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
     
     VolumeProfile volumeProfile;
     VolumeConsumer volumeInit;
-    const TChar* alsaCardString = "default";
+    Bws<AudioConfig::kMaxAlsaDeviceBytes> alsaOutputDevice;
+    AudioConfig::ReadOutputDeviceFromStore(*iConfigRamStore, alsaOutputDevice);
+    const TChar* alsaCardString = reinterpret_cast<const TChar*>(alsaOutputDevice.PtrZ());
     const std::vector<Brn> mixerList{Brn("Digital"), Brn("PCM"), Brn("Master"),
                                      Brn("Speaker"), Brn("DAC"), Brn("Analogue")};
-    iVolumeCtrl = std::make_unique<VolumeControl>(false, alsaCardString, mixerList);
+    iVolumeCtrl = std::make_unique<VolumeControl>(true, alsaCardString, mixerList);
 
     // Read Linn Amp settings from the config store (web config)
     Bws<LinnAmpConfig::kMaxSerialPortBytes> serialPortBuf;
@@ -503,6 +505,9 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
     // Register Linn Amp web config parameters (volume control choice and serial port)
     iLinnAmpConfig = std::make_unique<LinnAmpConfig>(iMediaPlayer->ConfigInitialiser());
 
+    // Audio hardware and KFR settings are applied when the player next starts.
+    iAudioConfig = std::make_unique<AudioConfig>(iMediaPlayer->ConfigInitialiser());
+
     // Register pipeline buffer web config parameters (applied at next start)
     iPipelineConfig = std::make_unique<PipelineConfig>(iMediaPlayer->ConfigInitialiser());
 
@@ -512,9 +517,19 @@ TestMediaPlayer::TestMediaPlayer(Net::DvStack& aDvStack, Net::CpStack& aCpStack,
     // RadioPresets in InitialiseSubsystems, after the Radio source is added.
     iRadioPresetsStatic = std::make_unique<RadioPresetsStatic>(iMediaPlayer->ConfigInitialiser());
  
-    iDriver = std::make_unique<DriverAlsa>(iMediaPlayer->Pipeline(),
-                                           PipelineConfig::ReadAlsaBufferUsFromStore(*iConfigRamStore),
-                                           0, aKFRConfigDir);
+    Bws<AudioConfig::kMaxKfrIrDirectoryBytes> kfrIrDirectory;
+    AudioConfig::ReadKfrIrDirectoryFromStore(*iConfigRamStore, kfrIrDirectory);
+    const Brn kfrIrConfigDir = kfrIrDirectory.Bytes() > 0
+        ? Brn(kfrIrDirectory.Ptr(), kfrIrDirectory.Bytes())
+        : Brn(aKFRConfigDir.Ptr(), aKFRConfigDir.Bytes());
+    const TUint kfrOutputRate = AudioConfig::ReadKfrOutputRateFromStore(*iConfigRamStore);
+    OhLog::Print("Audio output: %s, KFR output rate: %u Hz (0 follows input), IR directory: %.*s\n",
+                 alsaCardString, kfrOutputRate, PBUF(kfrIrConfigDir));
+    iDriver = std::make_unique<DriverAlsa>(
+        iMediaPlayer->Pipeline(),
+        Brn(alsaOutputDevice.Ptr(), alsaOutputDevice.Bytes()),
+        PipelineConfig::ReadAlsaBufferUsFromStore(*iConfigRamStore),
+        kfrOutputRate, kfrIrConfigDir);
 #if 1
     if (iDriver == NULL)
     {
@@ -773,11 +788,12 @@ void TestMediaPlayer::RegisterPlugins(Environment& aEnv)
         iMediaPlayer->Add(ProtocolFactory::NewTidal(ssl, clientId, clientSecret, apps, *iMediaPlayer));
     }
 # ifdef CAPTURE_ALSA
-    Media::ProtocolAlsaCapture::DevParam devParam{
-        .iDevName = Bws<64>("plughw:1,0"),
-        .iSampleRate = 48000,
-        .iChannels = 2
-    };
+    Media::ProtocolAlsaCapture::DevParam devParam;
+    Bws<AudioConfig::kMaxAlsaDeviceBytes> captureDevice;
+    AudioConfig::ReadCaptureDeviceFromStore(*iConfigRamStore, captureDevice);
+    devParam.iDevName.Replace(captureDevice);
+    devParam.iSampleRate = AudioConfig::ReadCaptureSampleRateFromStore(*iConfigRamStore);
+    OhLog::Print("ALSA capture: %.*s at %u Hz\n", PBUF(captureDevice), devParam.iSampleRate);
     iMediaPlayer->Add(new Media::ProtocolAlsaCapture(devParam, aEnv));
 #endif
 
@@ -1205,3 +1221,4 @@ void TestMediaPlayerInit::CreateCanonicalUuid(const Brx& aSeed, Bwh& aUuid)
     }
     aUuid.PtrZ();
 }
+

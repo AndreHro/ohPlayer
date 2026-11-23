@@ -3,7 +3,6 @@
 #include "IDataSink.h"
 #include "ConvertBELE.h"
 #include "OhLog.h"
-
 #include <alsa/asoundlib.h>
 #include <errno.h>
 #include <memory>
@@ -11,13 +10,15 @@
 #include <algorithm>
 #include <cerrno> 
 #include <cstdint>
+#include <fstream>
 #include <limits>
 #include <string>
+#include <chrono>
+#include <mutex>
 
 
 using namespace OpenHome;
 using namespace OpenHome::Media;
-
 
 PriorityArbitratorDriver::PriorityArbitratorDriver(TUint aOpenHomeMax)
 : iOpenHomeMax(aOpenHomeMax)
@@ -122,9 +123,17 @@ public:
 #if 0    
     void WritePcmDirect(const Brx& aData, TUint aNumChannels, TUint aSubsampleBytes);
 #endif
+
 private:
-    TBool TryProfile(Profile& aProfile, TUint aBitDepth, TUint aNumChannels,
-                     TUint aSampleRate, TUint aBufferUs);
+    static TBool IsDeviceDisconnected(int aError);
+    TBool EnsureDeviceOpen();
+    TBool IsAlsaCardPresent() const;
+    void CloseDevice();
+    TBool ReconfigureCurrentStreamLocked();
+
+private:
+    TBool TryProfileLocked(Profile& aProfile, TUint aBitDepth, TUint aNumChannels,
+                           TUint aSampleRate, TUint aBufferUs);
 private:
     snd_pcm_t* iHandle{nullptr};
     Bwh iSampleBuffer;  // buffer ProcessSampleX data
@@ -138,6 +147,16 @@ private:
     TUint iWaitCount;
     TUint iBufferUs;
     std::string iKfrIrConfigDir;
+
+    std::string iAlsaDevice;
+    mutable std::mutex iAlsaMutex;
+    std::chrono::steady_clock::time_point iLastOpenAttempt{};
+    TBool iLastOpenFailedLogged{false};
+
+    TUint iLastBitDepth{0};
+    TUint iLastNumChannels{0};
+    TUint iLastInputRate{0};
+    TBool iHasStreamSpec{false};
 
     TUint iOutputSampleRate;
     std::atomic<TUint> iCurrentOutputRate{0};
@@ -154,7 +173,8 @@ DriverAlsaPimpl::DriverAlsaPimpl(
     TUint aBufferUs,
     TUint aOutputSampleRate,
     const Brx& aKfrIrConfigDir)
-: iHandle(nullptr)
+: iAlsaDevice(reinterpret_cast<const char*>(aAlsaDevice.Ptr()), aAlsaDevice.Bytes())
+, iHandle(nullptr)
 , iSampleBuffer(kSampleBufSize)
 , iSampleBytes(0)
 , iDuplicateChannel(false)
@@ -171,18 +191,6 @@ DriverAlsaPimpl::DriverAlsaPimpl(
 , iOutputSampleRate(aOutputSampleRate)
 , iCurrentOutputRate(aOutputSampleRate)
 {
-    const Brhz devName(aAlsaDevice);
-    OhLog::Print("DriverAlsa: Opening ALSA device %s\n", devName.CString());
-    const int err = snd_pcm_open(&iHandle, devName.CString(), SND_PCM_STREAM_PLAYBACK, 0);
-
-    if (err < 0) {
-        OhLog::PrintError(
-            "DriverAlsa: snd_pcm_open() failed: %s\n", std::string(snd_strerror(err)).c_str());
-        iHandle = nullptr;
-        iDitch = true;
-        return;
-    }
-
     AudioSpec initialSpec{};
     initialSpec.iNumChannels = 2;
     initialSpec.iBitDepth = 32;
@@ -196,41 +204,171 @@ DriverAlsaPimpl::DriverAlsaPimpl(
         OutputFormat(SND_PCM_FORMAT_S32_LE, 4),
         OutputFormat(SND_PCM_FORMAT_S32_LE, 4),
         OutputFormat(SND_PCM_FORMAT_S32_LE, 4),
-        OutputFormat(SND_PCM_FORMAT_S32_LE, 4));   
+        OutputFormat(SND_PCM_FORMAT_S32_LE, 4));
+
+    std::lock_guard<std::mutex> lock(iAlsaMutex);
+    if (!EnsureDeviceOpen()) {
+        iDitch = true;
+    }  
 }
 
 DriverAlsaPimpl::~DriverAlsaPimpl()
 {
+    std::lock_guard<std::mutex> lock(iAlsaMutex);
+    CloseDevice();
+}
+
+TBool DriverAlsaPimpl::IsDeviceDisconnected(int aError)
+{
+    return aError == -ENODEV || aError == -ESHUTDOWN ||
+           aError == -EIO || aError == -ESTRPIPE;
+}
+
+void DriverAlsaPimpl::CloseDevice()
+{
     if (iHandle != nullptr) {
-        const int err = snd_pcm_close(iHandle);
-        ASSERT(err == 0);
+        snd_pcm_close(iHandle);
         iHandle = nullptr;
     }
 }
 
+TBool DriverAlsaPimpl::IsAlsaCardPresent() const
+{
+    const auto cardKey = iAlsaDevice.find("CARD=");
+    if (cardKey == std::string::npos) {
+        return true;
+    }
+
+    const auto cardStart = cardKey + sizeof("CARD=") - 1;
+    const auto cardEnd = iAlsaDevice.find(',', cardStart);
+    const std::string cardName = iAlsaDevice.substr(
+        cardStart, cardEnd == std::string::npos ? std::string::npos : cardEnd - cardStart);
+    if (cardName.empty()) {
+        return true;
+    }
+
+    std::ifstream cardsFile("/proc/asound/cards");
+    if (!cardsFile) {
+        return true;
+    }
+
+    std::string line;
+    while (std::getline(cardsFile, line)) {
+        const auto idStart = line.find('[');
+        const auto idEnd = line.find(']', idStart);
+        if (idStart == std::string::npos || idEnd == std::string::npos) {
+            continue;
+        }
+
+        const auto nameStart = line.find_first_not_of(" \t", idStart + 1);
+        const auto nameEnd = line.find_last_not_of(" \t", idEnd - 1);
+        if (nameStart != std::string::npos && nameEnd >= nameStart &&
+            line.compare(nameStart, nameEnd - nameStart + 1, cardName) == 0 &&
+            nameEnd - nameStart + 1 == cardName.size()) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+TBool DriverAlsaPimpl::EnsureDeviceOpen()
+{
+    if (iHandle != nullptr) {
+        return true;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (iLastOpenAttempt.time_since_epoch().count() != 0 &&
+        (now - iLastOpenAttempt) < std::chrono::milliseconds(500)) {
+        return false;
+    }
+    iLastOpenAttempt = now;
+
+    if (!IsAlsaCardPresent()) {
+        if (!iLastOpenFailedLogged) {
+            OhLog::PrintError("DriverAlsa: ALSA card for %s is not present; waiting for DAC.\n",
+                              iAlsaDevice.c_str());
+        }
+        iLastOpenFailedLogged = true;
+        return false;
+    }
+
+    OhLog::Print("DriverAlsa: Opening ALSA device %s\n", iAlsaDevice.c_str());
+    const int err = snd_pcm_open(&iHandle, iAlsaDevice.c_str(), SND_PCM_STREAM_PLAYBACK, 0);
+    if (err < 0) {
+        if (!iLastOpenFailedLogged) {
+            OhLog::PrintError("DriverAlsa: snd_pcm_open() failed: %s\n", snd_strerror(err));
+        }
+        iHandle = nullptr;
+        iLastOpenFailedLogged = true;
+        return false;
+    }
+
+    iLastOpenFailedLogged = false;
+    OhLog::Print("DriverAlsa: ALSA device %s opened.\n", iAlsaDevice.c_str());
+    return true;
+}
+
+TBool DriverAlsaPimpl::ReconfigureCurrentStreamLocked()
+{
+    if (!iHasStreamSpec || iProfile == nullptr) {
+        return false;
+    }
+
+    iDuplicateChannel = (iLastNumChannels == 1);
+    const TUint outputRate = iOutputSampleRate ? iOutputSampleRate : iLastInputRate;
+    iCurrentOutputRate.store(outputRate);
+
+    if (!TryProfileLocked(*iProfile, iLastBitDepth, iLastNumChannels,
+                          outputRate, iBufferUs)) {
+        iSampleBytes = 0;
+        iDitch = true;
+        return false;
+    }
+
+    const OutputFormat outputFormat = iProfile->GetFormat(iLastBitDepth);
+    const TUint outputChannels =
+        (iDuplicateChannel && iLastNumChannels == 1) ? 2 : iLastNumChannels;
+    iSampleBytes = outputChannels * outputFormat.second;
+    iDitch = false;
+    return true;
+}
+
 void DriverAlsaPimpl::ProcessPlayable(MsgPlayable* aMsg)
 {
-    if (iProfile == nullptr || iDitch) {
+    if (iProfile == nullptr || (iDitch && !iHasStreamSpec)) {
         return;
     }
-    auto & pcmProcessor = iProfile->GetPcmProcessor();
+    auto& pcmProcessor = iProfile->GetPcmProcessor();
     aMsg->Read(pcmProcessor);
 }
 
 void DriverAlsaPimpl::ProcessDrain()
 {
-    if (iProfile == nullptr || iHandle == nullptr) {
+    if (iProfile == nullptr) {
         return;
     }
     // Flush the resampler before ALSA is drained.
     iProfile->GetPcmProcessor().Flush();
 
+    std::lock_guard<std::mutex> lock(iAlsaMutex);
+    if (iHandle == nullptr) {
+        return;
+    }
     snd_pcm_state_t state = snd_pcm_state(iHandle);
+    if (state == SND_PCM_STATE_DISCONNECTED || static_cast<int>(state) < 0) {
+        CloseDevice();
+        return;
+    }
     if (state == SND_PCM_STATE_XRUN) {
         const int recoverError = snd_pcm_recover(iHandle, -EPIPE, 1);
         if (recoverError < 0) {
             OhLog::PrintError("DriverAlsa: XRUN recovery failed: %s\n",
                               std::string(snd_strerror(recoverError)).c_str());
+            if (IsDeviceDisconnected(recoverError)) {
+                CloseDevice();
+            }
         }
         return;
     }
@@ -240,11 +378,23 @@ void DriverAlsaPimpl::ProcessDrain()
 
     auto err = snd_pcm_drain(iHandle);
     if (err < 0) {
+        if (IsDeviceDisconnected(err)) {
+            OhLog::PrintError("DriverAlsa: DAC disconnected during drain (%s). Closing handle.\n",
+                              snd_strerror(err));
+            CloseDevice();
+            return;
+        }
         state = snd_pcm_state(iHandle);
         OhLog::PrintError("DriverAlsa: snd_pcm_drain() error: %s (state=%d)\n",
                           std::string(snd_strerror(err)).c_str(), state);
         const int recoverError = snd_pcm_recover(iHandle, err, 1);
         if (recoverError < 0) {
+            if (IsDeviceDisconnected(recoverError)) {
+                OhLog::PrintError("DriverAlsa: DAC disconnected during drain recovery (%s). Closing handle.\n",
+                                  snd_strerror(recoverError));
+                CloseDevice();
+                return;
+            }
             OhLog::PrintError("DriverAlsa: drain recovery failed: %s (state=%d)\n",
                               std::string(snd_strerror(recoverError)).c_str(),
                               snd_pcm_state(iHandle));
@@ -254,10 +404,18 @@ void DriverAlsaPimpl::ProcessDrain()
 
     err = snd_pcm_prepare(iHandle);
     if (err < 0) {
+        if (IsDeviceDisconnected(err)) {
+            CloseDevice();
+            return;
+        }
         OhLog::PrintError("DriverAlsa: snd_pcm_prepare() error: %s\n",
                           std::string(snd_strerror(err)).c_str());
         const int recoverError = snd_pcm_recover(iHandle, err, 1);
         if (recoverError < 0) {
+            if (IsDeviceDisconnected(recoverError)) {
+                CloseDevice();
+                return;
+            }
             OhLog::PrintError("DriverAlsa: prepare recovery failed: %s (state=%d)\n",
                               std::string(snd_strerror(recoverError)).c_str(),
                               snd_pcm_state(iHandle));
@@ -267,90 +425,66 @@ void DriverAlsaPimpl::ProcessDrain()
 
 void DriverAlsaPimpl::Write(const Brx& aData)
 {
+    std::unique_lock<std::mutex> lock(iAlsaMutex);
     if (iHandle == nullptr) {
-        return;
+        if (!ReconfigureCurrentStreamLocked()) {
+            return;
+        }
     }
 
-    if (iSampleBytes == 0) {
-        OhLog::PrintError("DriverAlsa: invalid sample size");
-        return;
-    }
-
-    if ((aData.Bytes() % iSampleBytes) != 0) {
-        OhLog::PrintError("DriverAlsa: PCM buffer is not frame aligned: "
-                          "bytes=%u frameBytes=%u remainder=%u",
-                          aData.Bytes(),
-                          iSampleBytes,
-                          aData.Bytes() % iSampleBytes);
+    if (iSampleBytes == 0 || (aData.Bytes() % iSampleBytes) != 0) {
         return;
     }
 
     const TByte* ptr = aData.Ptr();
     snd_pcm_uframes_t framesRemaining = aData.Bytes() / iSampleBytes;
-    
     TUint recoveryAttempts = 0;
     TUint retryTimeouts = 0;
     const TUint kMaxRecoveryAttempts = 5;
-
     while (framesRemaining > 0) {
         snd_pcm_sframes_t framesWritten = snd_pcm_writei(iHandle, ptr, framesRemaining);
 
-        // 1. Handle Errors Gracefully
         if (framesWritten < 0) {
-            if (framesWritten == -ENODEV || framesWritten == -ESHUTDOWN) {
-                OhLog::PrintError("DriverAlsa: Sound card disconnected. Dropping frame payload.\n");
-                return; 
-            }
-
-            // Log if it's a standard buffer underrun (Xrun)
-            if (framesWritten == -EPIPE) {
-                OhLog::PrintWarning("DriverAlsa: Buffer underrun (Xrun) detected. Attempting recovery...\n");
-            }
-
-            // Attempt to restore the hardware state
-            const int err = snd_pcm_recover(iHandle, framesWritten, 1);
-            if (err < 0) {
-                OhLog::PrintError("DriverAlsa: snd_pcm_recover failed: %s\n", std::string(snd_strerror(err)).c_str());
-                return; // Break out immediately to protect the pipeline thread
-            }
-
-            // Protect against infinite loop lockups if recovery keeps looping
-            recoveryAttempts++;
-            if (recoveryAttempts > kMaxRecoveryAttempts) {
-                OhLog::PrintError("DriverAlsa: Unrecoverable recovery loop cascade. Dropping block.\n");
+            if (IsDeviceDisconnected(static_cast<int>(framesWritten))) {
+                OhLog::PrintError("DriverAlsa: DAC disconnected (%s). Closing handle for auto-reconnect.\n",
+                                  snd_strerror(static_cast<int>(framesWritten)));
+                CloseDevice();
+                iDitch = true;
                 return;
             }
 
+            const int err = snd_pcm_recover(iHandle, static_cast<int>(framesWritten), 1);
+            if (err < 0) {
+                OhLog::PrintError("DriverAlsa: snd_pcm_recover failed: %s\n", snd_strerror(err));
+                if (IsDeviceDisconnected(err)) {
+                    CloseDevice();
+                    iDitch = true;
+                }
+                return;
+            }
+
+            if (++recoveryAttempts > kMaxRecoveryAttempts) {
+                return;
+            }
             ++iRecoverCount;
-               OhLog::Print("DriverAlsa: recovered from %s (recoveries=%u)",
-                           snd_strerror(static_cast<int>(framesWritten)),
-                       iRecoverCount);
             continue;
         }
+
         if (framesWritten == 0) {
             const int err = snd_pcm_wait(iHandle, 500);
-
             if (err < 0) {
-                OhLog::PrintError(
-                    "DriverAlsa: snd_pcm_wait() error: %s\n",
-                    std::string(snd_strerror(err)).c_str());
+                if (IsDeviceDisconnected(err)) {
+                    CloseDevice();
+                    iDitch = true;
+                }
                 return;
             }
-
-            if (err == 0) {
-                ++retryTimeouts;
-
-                if (retryTimeouts > kMaxRecoveryAttempts) {
-                    OhLog::PrintError(
-                        "DriverAlsa: Repeated ALSA wait timeouts. "
-                        "Dropping block.\n");
-                    return;
-                }
+            if (err == 0 && ++retryTimeouts > kMaxRecoveryAttempts) {
+                return;
             }
-            else {
+            if (err > 0) {
                 retryTimeouts = 0;
             }
-
             continue;
         }
 
@@ -363,47 +497,15 @@ void DriverAlsaPimpl::Write(const Brx& aData)
         retryTimeouts = 0;
     }
 }
-#if 0
-void DriverAlsaPimpl::WritePcmDirect(const Brx& aData, TUint aNumChannels, TUint aSubsampleBytes)
-{
-    if (iSampleBytes == 0) {
-        OhLog::PrintError("DriverAlsa: invalid sample size\n");
-        return;
-    }
-
-    const TUint inputBytes = aData.Bytes();
-    const TUint bytesPerFrame = aNumChannels * aSubsampleBytes;
-    const TUint frames = inputBytes / bytesPerFrame;
-    if (frames == 0) {
-        return;
-    }
-
-    const TUint totalSamples = frames * aNumChannels;
-    const TUint outputBytes = totalSamples * sizeof(TInt32);
-
-    if (iS32ConversionBuffer.size() < outputBytes) {
-        iS32ConversionBuffer.resize(outputBytes);
-    }
-
-    OpenHome::Media::ConvertInterleavedToS32LE_With24Simd(
-        aData.Ptr(),
-        inputBytes,
-        iS32ConversionBuffer.data(),
-        frames,
-        aNumChannels,
-        aSubsampleBytes,
-        false /* OH PIPELINE IS ALWAYS BE */,
-        iDuplicateChannel && aNumChannels == 1,
-        iTmpOut);
-
-    const Brn converted(iS32ConversionBuffer.data(), outputBytes);
-    Write(converted);
-}
-#endif
 
 #ifdef DEBUG
 void DriverAlsaPimpl::LogPCMState()
 {
+    std::lock_guard<std::mutex> lock(iAlsaMutex);
+    if (iHandle == nullptr) {
+        OhLog::PrintDebug("DriverAlsa: PCM STATE: NULL\n");
+        return;
+    }
     switch (snd_pcm_state(iHandle))
     {
         case SND_PCM_STATE_OPEN:
@@ -442,9 +544,14 @@ void DriverAlsaPimpl::LogPCMState()
 
 void DriverAlsaPimpl::ProcessDecodedStream(MsgDecodedStream* aMsg)
 {
+ 
+ 
+    
     if (iProfile == nullptr) {
+	Log::Print("DriverAlsa: iProfile nullptr");
         iDitch = true;
         iSampleBytes = 0;
+        iHasStreamSpec = false;
         return;
     }
 
@@ -473,31 +580,13 @@ void DriverAlsaPimpl::ProcessDecodedStream(MsgDecodedStream* aMsg)
     //
     // So we configure the playback for stereo and duplicate the
     // channel data.
-    if (decodedStreamInfo.NumChannels() == 1)
-    {
-        iDuplicateChannel = true;
-    }
-    else
-    {
-        iDuplicateChannel = false;
-    }
+    const TBool duplicateChannel = decodedStreamInfo.NumChannels() == 1;
 
     const TUint outputRate = iOutputSampleRate ? iOutputSampleRate
                                                 : decodedStreamInfo.SampleRate();
     iCurrentOutputRate.store(outputRate);
 
     const TUint bitDepth = decodedStreamInfo.BitDepth();
-    if (!TryProfile(*iProfile, bitDepth, decodedStreamInfo.NumChannels(),
-                    outputRate, iBufferUs)) {
-        Log::Print("DriverAlsa: No usable ALSA profile for stream: BitDepth = %u, "
-                   "SampleRate = %u, Channels = %u\n",
-                   bitDepth, decodedStreamInfo.SampleRate(),
-                   decodedStreamInfo.NumChannels());
-        iSampleBytes = 0;
-        iDitch = true;
-        return;
-    }
-
     KfrPcmProcessor& pcmProcessor =
         static_cast<KfrPcmProcessor&>(iProfile->GetPcmProcessor());
     AudioSpec spec{};
@@ -507,8 +596,26 @@ void DriverAlsaPimpl::ProcessDecodedStream(MsgDecodedStream* aMsg)
     spec.iOutputRate = outputRate;
     spec.iLowLatency = iLowLatencyMode;
 
-    pcmProcessor.SetDuplicateChannel(iDuplicateChannel);
+    pcmProcessor.SetDuplicateChannel(duplicateChannel);
     pcmProcessor.UpdateFormatSpec(spec);
+
+    std::lock_guard<std::mutex> lock(iAlsaMutex);
+    iDuplicateChannel = duplicateChannel;
+    iLastBitDepth = bitDepth;
+    iLastNumChannels = decodedStreamInfo.NumChannels();
+    iLastInputRate = decodedStreamInfo.SampleRate();
+    iHasStreamSpec = true;
+
+    if (!TryProfileLocked(*iProfile, bitDepth, decodedStreamInfo.NumChannels(),
+                          outputRate, iBufferUs)) {
+        Log::Print("DriverAlsa: No usable ALSA profile for stream: BitDepth = %u, "
+                   "SampleRate = %u, Channels = %u\n",
+                   bitDepth, decodedStreamInfo.SampleRate(),
+                   decodedStreamInfo.NumChannels());
+        iSampleBytes = 0;
+        iDitch = true;
+        return;
+    }
 
     const OutputFormat outputFormat = iProfile->GetFormat(bitDepth);
     const TUint outputChannels =
@@ -517,20 +624,24 @@ void DriverAlsaPimpl::ProcessDecodedStream(MsgDecodedStream* aMsg)
     iDitch = false;
 }
 
-TBool DriverAlsaPimpl::TryProfile(Profile& aProfile,
-                                  TUint aBitDepth,
-                                  TUint aNumChannels,
-                                  TUint aSampleRate,
-                                  TUint aBufferUs)
+TBool DriverAlsaPimpl::TryProfileLocked(Profile& aProfile,
+                                        TUint aBitDepth,
+                                        TUint aNumChannels,
+                                        TUint aSampleRate,
+                                        TUint aBufferUs)
 {
     if (aBitDepth != 32 && aBitDepth != 24 &&
         aBitDepth != 16 && aBitDepth != 8) {
         return false;
     }
 
-    if (iHandle == nullptr) {
-        return false;
+
+    if (!EnsureDeviceOpen()) {
+       OhLog::PrintError("DriverAlsa: Device not open yet in ProcessDecodedStream; will retry in Write()\n");
+       iDitch = true;
+       return false;
     }
+
 
     auto outputFormat = aProfile.GetFormat(aBitDepth);
 
@@ -539,9 +650,12 @@ TBool DriverAlsaPimpl::TryProfile(Profile& aProfile,
     snd_pcm_hw_params_alloca(&hwParams);
     snd_pcm_sw_params_alloca(&swParams);
 
-    auto fail = [](const char* aOperation, int aError) -> TBool {
+    auto fail = [this](const char* aOperation, int aError) -> TBool {
         Log::Print("DriverAlsa: %s failed: %s (%d)\n",
                    aOperation, snd_strerror(aError), aError);
+        if (IsDeviceDisconnected(aError)) {
+            CloseDevice();
+        }
         return false;
     };
 
@@ -666,6 +780,7 @@ TBool DriverAlsaPimpl::TryProfile(Profile& aProfile,
 
 TUint DriverAlsaPimpl::DriverDelayJiffies(TUint aSampleRate)
 {
+    std::lock_guard<std::mutex> lock(iAlsaMutex);
     const TUint dspDelay = iProfile == nullptr
         ? 0
         : static_cast<KfrPcmProcessor&>(iProfile->GetPcmProcessor()).GetDelayJiffies();
@@ -684,7 +799,7 @@ TUint DriverAlsaPimpl::DriverDelayJiffies(TUint aSampleRate)
     const snd_pcm_state_t state = snd_pcm_state(iHandle);
     if (state != SND_PCM_STATE_PREPARED && state != SND_PCM_STATE_RUNNING
         && state != SND_PCM_STATE_PAUSED && state != SND_PCM_STATE_XRUN) {
-        return 0;
+        return dspDelay;
     }
     int ret = snd_pcm_delay(iHandle, &delayFrames);
 
@@ -706,39 +821,32 @@ TUint DriverAlsaPimpl::DriverDelayJiffies(TUint aSampleRate)
 
 void DriverAlsaPimpl::ProcessMode(const Brx& aMode)
 {
-    iLowLatencyMode = aMode == Brn("ALSA_CAPTURE");
-    OhLog::Print(
-        "DriverAlsa: MsgMode intercepted. lowLatency=%u; purging pipeline tracking state.\n",
-        iLowLatencyMode);
-
+    const TBool lowLatencyMode = aMode == Brn("ALSA_CAPTURE");
     if (iProfile != nullptr) {
         iProfile->GetPcmProcessor().Flush();
     }
 
+    std::lock_guard<std::mutex> lock(iAlsaMutex);
+    iLowLatencyMode = lowLatencyMode;
+    OhLog::Print(
+        "DriverAlsa: MsgMode intercepted. lowLatency=%u; purging pipeline tracking state.\n",
+        iLowLatencyMode);
+
     iSampleBytes = 0;
     iDitch = true;
     iBytesSent = 0;
+    iHasStreamSpec = false;
 }
 
 DriverAlsa::DriverAlsa(IPipeline& aPipeline,
                        const Brx& aAlsaDevice,
                        TUint aBufferUs,
                        TUint aOutputSampleRate,
-                       bool aDisableUpsample,
                        const Brx& aKfrIrConfigDir)
 : PipelineDriverBase(aPipeline, std::make_unique<DriverAlsaPimpl>(
       aAlsaDevice, aBufferUs, aOutputSampleRate, aKfrIrConfigDir))
-{
-    (void)aDisableUpsample;
-}
-
-DriverAlsa::DriverAlsa(IPipeline& aPipeline,
-                       TUint aBufferUs,
-                       TUint aOutputSampleRate,
-                       const Brx& aKfrIrConfigDir)
-: DriverAlsa(aPipeline, Brn("default"), aBufferUs, aOutputSampleRate,
-             false, aKfrIrConfigDir)
 {}
+
 
 PipelineDriverBase::PipelineDriverBase(
     IPipeline& aPipeline,

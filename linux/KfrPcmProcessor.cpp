@@ -9,6 +9,7 @@
 #include <kfr/dsp.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -338,25 +339,31 @@ template <unsigned Bytes>
 inline double DecodeBe(const TByte* p)
 {
     if constexpr (Bytes == 4) {
-        const uint32_t v = (static_cast<uint32_t>(p[0]) << 24) |
-                           (static_cast<uint32_t>(p[1]) << 16) |
-                           (static_cast<uint32_t>(p[2]) << 8) |
-                           static_cast<uint32_t>(p[3]);
-        return static_cast<double>(SignExtend(v, 32)) / 2147483648.0;
+        uint32_t value;
+        std::memcpy(&value, p, sizeof(value));
+        if constexpr (std::endian::native == std::endian::little) {
+            value = __builtin_bswap32(value);
+        }
+        return static_cast<double>(std::bit_cast<int32_t>(value)) *
+               (1.0 / 2147483648.0);
     }
     else if constexpr (Bytes == 3) {
         const uint32_t v = (static_cast<uint32_t>(p[0]) << 16) |
                            (static_cast<uint32_t>(p[1]) << 8) |
                            static_cast<uint32_t>(p[2]);
-        return static_cast<double>(SignExtend(v, 24)) / 8388608.0;
+        return static_cast<double>(SignExtend(v, 24)) * (1.0 / 8388608.0);
     }
     else if constexpr (Bytes == 2) {
-        const uint32_t v = (static_cast<uint32_t>(p[0]) << 8) |
-                           static_cast<uint32_t>(p[1]);
-        return static_cast<double>(SignExtend(v, 16)) / 32768.0;
+        uint16_t value;
+        std::memcpy(&value, p, sizeof(value));
+        if constexpr (std::endian::native == std::endian::little) {
+            value = __builtin_bswap16(value);
+        }
+        return static_cast<double>(std::bit_cast<int16_t>(value)) *
+               (1.0 / 32768.0);
     }
     else {
-        return static_cast<double>(SignExtend(p[0], 8)) / 128.0;
+        return static_cast<double>(SignExtend(p[0], 8)) * (1.0 / 128.0);
     }
 }
 
@@ -403,14 +410,9 @@ inline int32_t DoubleToS32(double aVal)
     if (!std::isfinite(aVal)) {
         return 0;
     }
-    if (aVal <= -1.0) {
-        return std::numeric_limits<int32_t>::min();
-    }
-    if (aVal >= 1.0) {
-        return std::numeric_limits<int32_t>::max();
-    }
-    const double scale = aVal < 0.0 ? 2147483648.0 : 2147483647.0;
-    return static_cast<int32_t>(std::lrint(aVal * scale));
+    const double clamped = std::clamp(aVal, -1.0, 1.0);
+    const double scale = clamped < 0.0 ? 2147483648.0 : 2147483647.0;
+    return static_cast<int32_t>(std::lrint(clamped * scale));
 }
 
 } // namespace

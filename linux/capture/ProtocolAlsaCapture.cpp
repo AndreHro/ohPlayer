@@ -17,6 +17,22 @@
 using namespace OpenHome;
 using namespace OpenHome::Media;
 
+namespace {
+
+constexpr TUint kFramesPerRead = 256;
+constexpr TUint kCaptureBitDepth = 32;
+constexpr TUint kCaptureSampleSizeBytes = 4;
+constexpr TUint kCaptureLatencyUs = 20000;
+constexpr TUint kInitialPrefillChunks = 3;                 // ~16 ms prefill
+constexpr TUint kDefaultDelayJiffies = Jiffies::kPerMs * 20; // 20 ms (matches kCaptureLatencyUs)
+//constexpr TUint kInitialPrefillChunks = 5;
+//constexpr TUint kDefaultDelayJiffies = Jiffies::kPerMs * 100;
+constexpr snd_pcm_format_t kCaptureFormat = SND_PCM_FORMAT_S32_LE;
+constexpr snd_pcm_access_t kCaptureAccess = SND_PCM_ACCESS_RW_INTERLEAVED;
+constexpr int kAllowSoftwareResampling = 1;
+
+} // namespace
+
 class OpenHomeAudioPool : public INonCopyable
 {
 public:
@@ -169,6 +185,7 @@ private:
     snd_pcm_t*                 iCaptureHandle;
     Mutex                      iCaptureLock;
     std::atomic<bool>          iInterrupted;
+    std::atomic<bool>          iCaptureError;
     Media::SupplyAggregator*   iSupply;
     Uri                        iUri;
     Semaphore                  iSemDrain;
@@ -179,12 +196,6 @@ private:
     OpenHomeAudioPool          iAudioPool; // Native Object Queue replaces the custom ring buffer
     ThreadFunctor*             iCaptureThread;
 
-    static constexpr TUint     kDefaultSampleRate  = 44100;
-    static constexpr TUint     kDefaultChannels    = 2;
-    static constexpr TUint     kBitDepth           = 32;
-    static constexpr TUint     kSampleSizeBytes    = 4;
-    static constexpr TUint     kDefaultDelayJiffies = Jiffies::kPerMs * 100;
-    static constexpr TUint     kInitialPrefillChunks = 5;
 };
 
 ProtocolAlsaCapture::Pimpl::Pimpl(const DevParam& aDevParam, Environment& aEnv)
@@ -192,6 +203,7 @@ ProtocolAlsaCapture::Pimpl::Pimpl(const DevParam& aDevParam, Environment& aEnv)
 , iCaptureHandle(nullptr)
 , iCaptureLock("pac")
 , iInterrupted(false)
+, iCaptureError(false)
 , iSupply(nullptr)
 , iSemDrain("PACD", 0)
 , iSemPrefill("PACF", 0)
@@ -245,11 +257,11 @@ bool ProtocolAlsaCapture::Pimpl::OpenHardwareCapture()
             SND_PCM_NONBLOCK);
 
         if (err >= 0) {
-            err = snd_pcm_set_params(iCaptureHandle,
-                    SND_PCM_FORMAT_S32_LE,
-                    SND_PCM_ACCESS_RW_INTERLEAVED,
+                err = snd_pcm_set_params(iCaptureHandle,
+                    kCaptureFormat,
+                    kCaptureAccess,
                     iChannels,
-                    iSampleRate, 1, 100000);
+                    iSampleRate, kAllowSoftwareResampling, kCaptureLatencyUs);
         }
 
         if (err >= 0) {
@@ -332,8 +344,7 @@ void ProtocolAlsaCapture::Pimpl::StopCaptureThread()
 
 void ProtocolAlsaCapture::Pimpl::CaptureThreadLoop()
 {
-    constexpr TUint kFramesPerRead = 1024;
-    const TUint bytesPerFrame = iChannels * kSampleSizeBytes;
+    const TUint bytesPerFrame = iChannels * kCaptureSampleSizeBytes;
     std::vector<TByte> localBuffer(kFramesPerRead * bytesPerFrame);
     TUint framesCollected = 0;
     TUint droppedBlocks = 0;
@@ -372,6 +383,7 @@ void ProtocolAlsaCapture::Pimpl::CaptureThreadLoop()
             if (recoverStatus < 0) {
                 Log::Print("ProtocolAlsaCapture: ERROR - S/PDIF clock lost or device disconnected (%s). Exiting worker.\n", 
                            std::string(snd_strerror(recoverStatus)).c_str());
+                iCaptureError.store(true);
                 iInterrupted.store(true);
                 iAudioPool.Interrupt();
                 iSemPrefill.Signal();
@@ -433,9 +445,11 @@ void ProtocolAlsaCapture::Pimpl::CaptureThreadLoop()
 
 ProtocolStreamResult ProtocolAlsaCapture::Pimpl::RunStreamPipeline(IStreamHandler& aStreamHandler, TUint aStreamId, const Brx& aUri)
 {
+    iCaptureError.store(false);
+
     SpeakerProfile sp;
     PcmStreamInfo streamInfo;
-    streamInfo.Set(kBitDepth, iSampleRate, iChannels,
+    streamInfo.Set(kCaptureBitDepth, iSampleRate, iChannels,
         AudioDataEndian::Little, sp, 0LL);
 
     iSupply->OutputPcmStream(aUri, 0LL, false, true, Multiroom::Forbidden, aStreamHandler, aStreamId, streamInfo);
@@ -463,6 +477,9 @@ ProtocolStreamResult ProtocolAlsaCapture::Pimpl::RunStreamPipeline(IStreamHandle
             iAudioPool.RecycleChunk(chunk);
         }
 
+        result = iCaptureError.load()
+            ? EProtocolStreamErrorRecoverable
+            : EProtocolStreamStopped;
         StopCaptureThread();
         iSupply->Flush();
     }
@@ -472,7 +489,6 @@ ProtocolStreamResult ProtocolAlsaCapture::Pimpl::RunStreamPipeline(IStreamHandle
         throw;
     }
 
-    StopCaptureThread();
     return result;
 }
 

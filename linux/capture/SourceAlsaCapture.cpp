@@ -64,7 +64,10 @@ void SourceAlsaCapture::Activate(TBool /*aAutoPlay*/, TBool /*aPrefetchAllowed*/
     iPipeline.Begin(iUriProvider->Mode(), iUriProvider->CurrentTrackId());
     iStopped.store(false);
 
-    iPipeline.Play();
+void SourceAlsaCapture::Deactivate()
+{
+    iStopped.store(true);
+    Av::Source::Deactivate();
 }
 
 TBool SourceAlsaCapture::TryActivateNoPrefetch(const Brx& aMode)
@@ -89,7 +92,7 @@ void SourceAlsaCapture::StandbyEnabled()
 
 void SourceAlsaCapture::Play()
 {
-    if (!iConnected.load()) {
+    if (!iConnected.load() || !IsActive()) {
         return;
     }
     if (iStopped.load()) {
