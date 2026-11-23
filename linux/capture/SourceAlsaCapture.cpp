@@ -63,6 +63,7 @@ void SourceAlsaCapture::Activate(TBool /*aAutoPlay*/, TBool /*aPrefetchAllowed*/
 
     iPipeline.Begin(iUriProvider->Mode(), iUriProvider->CurrentTrackId());
     iStopped.store(false);
+}
 
 void SourceAlsaCapture::Deactivate()
 {
