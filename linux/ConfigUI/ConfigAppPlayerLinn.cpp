@@ -1,4 +1,5 @@
 #include "ConfigAppPlayerLinn.h"
+#include "AudioConfig.h"
 #include "LinnAmp/LinnAmpConfig.h"
 #include "PipelineConfig.h"
 #include "RadioPresetsStatic.h"
@@ -80,6 +81,11 @@ ConfigAppPlayerLinn::ConfigAppPlayerLinn(IInfoAggregator& aInfoAggregator,
     AddConfigNum(PipelineConfig::kKeyStarvationRamperMinSize);
     AddConfigNum(PipelineConfig::kKeyEncodedReservoirSize);
     AddConfigNum(PipelineConfig::kKeyAlsaBufferUs);
+    AddConfigText(AudioConfig::kKeyOutputDevice);
+    AddConfigText(AudioConfig::kKeyCaptureDevice);
+    AddConfigNum(AudioConfig::kKeyCaptureSampleRate);
+    AddConfigNum(AudioConfig::kKeyKfrOutputRate);
+    AddConfigText(AudioConfig::kKeyKfrIrDirectory);
     // Expose ohPipeline's internal volume control toggle (hidden by default).
     // Allows disabling the volume control point-side on setups where the
     // sound card has no mixer and no external amplifier controls volume.

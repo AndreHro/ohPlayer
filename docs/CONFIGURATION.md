@@ -1,6 +1,12 @@
 # Configuration
 
-Settings live in the web configuration ui, available on the renderer's presentation url (the `<device ip>` presentation link advertised via UPnP, port 8080 by default). Changes to pipeline buffers are applied at the next start.
+Settings live in the web configuration ui, available on the renderer's presentation url (the `<device ip>` presentation link advertised via UPnP, port 8080 by default). Changes to pipeline buffers and audio hardware settings are applied at the next start.
+
+## Audio hardware and KFR
+
+The Device tab's detailed settings include the ALSA output and capture device names, the capture sample rate, and the KFR output sample rate and impulse-response directory. These values are persisted in the store and applied at the next start. Use stable ALSA card IDs (for example, `hw:CARD=MyDac,DEV=0`) rather than enumeration-based card numbers where possible.
+
+`Audio.KfrOutputRate` defaults to `0`, which follows the input stream's sample rate. Set a nonzero rate to make KFR resample to that output rate; use a rate supported by the selected DAC. The IR directory setting overrides `--kfr-config-dir` when non-empty. `CAPTURE_ALSA` remains a build-time option: these settings select its device and rate only when capture support was included in the build.
 
 ## Pipeline buffers
 

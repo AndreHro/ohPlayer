@@ -38,6 +38,7 @@
 #include <OpenHome/Net/Odp/DviServerOdp.h>
 #include <OpenHome/FsFlushPeriodic.h>
 #include "DriverAlsa.h"
+#include "AudioConfig.h"
 
 #ifdef CAPTURE_ALSA
 #include "capture/SourceAlsaCapture.h"
@@ -281,6 +282,7 @@ private:
 
     std::unique_ptr<OhLinnAmpVolume> iLinnAmpVolume;
     std::unique_ptr<LinnAmpConfig> iLinnAmpConfig;
+    std::unique_ptr<AudioConfig> iAudioConfig;
     std::unique_ptr<PipelineConfig> iPipelineConfig;
     std::unique_ptr<RadioPresetsStatic> iRadioPresetsStatic;
     std::unique_ptr<Av::RadioBrowserMediaServer> iRadioBrowserMediaServer;

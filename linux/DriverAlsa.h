@@ -93,10 +93,7 @@ public:
         const Brx& aAlsaDevice, 
         TUint aBufferUs,
         TUint aOutputSampleRate=0,
-        bool aDisableUpsample=false,
         const Brx& aKfrIrConfigDir=Brn(""));
-    DriverAlsa(IPipeline& aPipeline, TUint aBufferUs, TUint aOutputSampleRate=0,
-               const Brx& aKfrIrConfigDir=Brn(""));
 };
 
 } // namespace Media
