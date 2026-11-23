@@ -1,7 +1,7 @@
-#include "OhLog.h"
-#include "OpenHomePlayer.h"
+//#include "OpenHomePlayer.h"
 #include "TestMediaPlayer.h"
 #include "RadioNowPlayingTest.h"
+#include "OhLog.h"
 #include <OpenHome/Private/Network.h> // SslContext
 #include <OpenHome/Types.h>
 #include <OpenHome/Media/Tests/Cdecl.h>
@@ -11,14 +11,13 @@
 #include <OpenHome/Media/PipelineManager.h>
 #include <OpenHome/Private/Thread.h>
 #include <OpenHome/Functor.h>
-//#include "DriverAlsa.h"
+#include <memory>
 #include <stdlib.h>
 
 using namespace OpenHome;
 using namespace OpenHome::Av;
 using namespace OpenHome::Av::Test;
 using namespace OpenHome::Net;
-//using namespace OpenHome::Media;
 
 class TestMediaPlayerThread
 {
@@ -53,21 +52,18 @@ TestMediaPlayerThread::~TestMediaPlayerThread()
 
 void TestMediaPlayerThread::Run()
 {
-    ThreadFunctor* th = new ThreadFunctor("TestMediaPlayer", MakeFunctor(*this, &TestMediaPlayerThread::RunInThread));
+    auto th = std::make_unique<ThreadFunctor>("TestMediaPlayer", MakeFunctor(*this, &TestMediaPlayerThread::RunInThread));
     th->Start();
-    delete th;
 }
-TestMediaPlayer* tmp;
 
 void TestMediaPlayerThread::RunInThread()
 {
-    const TChar* cookie ="TestMediaPlayerMain";
+    const TChar* cookie = "TestMediaPlayerMain";
     NetworkAdapter* adapter = iLib->CurrentSubnetAdapter(cookie);
     CpStack* cpStack = nullptr;
     DvStack* dvStack = nullptr;
-//    OpenHome::Media::DriverAlsa     *driver  = NULL;
     iLib->StartCombined(adapter->Subnet(), cpStack, dvStack);
-
+    
     // --test-radio-meta: probe now-playing endpoints of test radio stations and exit
     if (iOptions.TestRadioMeta().Value()) {
         SslContext ssl;
@@ -94,59 +90,32 @@ void TestMediaPlayerThread::RunInThread()
     OhLog::Print("ODP port: %u, Web UI port: %u\n",
         iOptions.OptionOdp().Value(), iOptions.OptionWebUi().Value());
 
-
     // Create TestMediaPlayer.
-    tmp = new TestMediaPlayer(*dvStack, *cpStack, iOptions.Udn().Value(), iOptions.Room().CString(), iOptions.Name().CString(),
+    TestMediaPlayer* player = new TestMediaPlayer(*dvStack, *cpStack, iOptions.Udn().Value(), iOptions.Room().CString(), iOptions.Name().CString(),
         iOptions.TuneIn().Value(), iOptions.Tidal().Value(), iOptions.Qobuz().Value(),
-        iOptions.UserAgent().Value(), iOptions.StoreFile().CString(), iOptions.OptionOdp().Value(), iOptions.OptionWebUi().Value(), iOptions.RadioBrowser().Value());
-    tmp->Run();
-    OhLog::Print("Shutting down pipeline\n");
-    tmp->StopPipeline();
-    delete tmp;
+        iOptions.UserAgent().Value(), iOptions.StoreFile().CString(), iOptions.KfrConfigDir().Value(),
+        iOptions.OptionOdp().Value(), iOptions.OptionWebUi().Value());
+    Log::Print("%s:%d\n", __FILE__, __LINE__);
+    Log::Print("%s:%d\n", __FILE__, __LINE__);
+    player->Run();
+    Log::Print("%s:%d\n", __FILE__, __LINE__);
+    player->StopPipeline();
+    Log::Print("%s:%d\n", __FILE__, __LINE__);
+    delete player;
 }
-#include<stdio.h>
-#include<signal.h>
-#include<unistd.h>
-void CDECL sig_handler(int signo);
-const gchar        *g_appName   = "OpenHomePlayer";
+
 int CDECL main(int aArgc, char* aArgv[])
 {
-    // Enable the ohPlayer application log level; OHP_DEBUG additionally
-    // enables debug-severity messages.
-    OhLog::SetDebugEnabled(false);
-    Debug::AddLevel(OhLog::kLevel);
-    {
-        const char* dbg = getenv("OHP_DEBUG");
-        if (dbg != nullptr && dbg[0] != '\0' && strcmp(dbg, "0") != 0) {
-            OhLog::SetDebugEnabled(true);
-        }
-    }
-#ifdef _WIN32
-    char* noErrDlgs = getenv("NO_ERROR_DIALOGS");
-    if (noErrDlgs != nullptr && strcmp(noErrDlgs, "1") == 0) {
-        _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
-    }
-#endif // _WIN32
-    //if (signal(SIGINT, sig_handler) == SIG_ERR) {}
     // Parse options.
     TestMediaPlayerOptions options;
     if (!options.Parse(aArgc, aArgv)) {
         return 1;
     }
 
-    TestMediaPlayerThread* th = new TestMediaPlayerThread(options);
+    auto th = std::make_unique<TestMediaPlayerThread>(options);
     th->Run();
-    delete th;
 
     return 0;
 }
 
-void CDECL sig_handler(int signo)
-{
-  if (signo == SIGINT)
-  {
-    tmp->RequestExit();
-    OhLog::Print("Received SIGINT\n");
-  }
-}
 

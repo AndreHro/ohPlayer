@@ -1,4 +1,6 @@
 #!/bin/bash
+set -e
+
 PLATFORM="aarch64-scarthgap-linux"
 DEBUG_MODE="Release"
 DEPS_DIR="./dependencies/${PLATFORM}"
@@ -26,26 +28,17 @@ for NAME in "${!DEPS[@]}"; do
     MAP_VAL=${PLATFORM_MAP[$NAME]}
     
     if [ -z "$MAP_VAL" ]; then
-        # For completely clean, platform-independent packages like ohWafHelpers
         URL="${HOST}/${DROP}/${NAME}/${NAME}-${VERSION}.tar.gz"
     else
-        # For standard platform-specific packages and the AnyPlatform tracker tag
         URL="${HOST}/${DROP}/${NAME}/${NAME}-${VERSION}-${MAP_VAL}.tar.gz"
     fi
     
     echo "Target URL: $URL"
-    
-    # Create the target directory path safely
     TARGET_PATH="${DEPS_DIR}/${NAME}"
     mkdir -p "$TARGET_PATH"
     
-    curl -sSL "$URL" | tar -xz -C "$TARGET_PATH" --strip-components=1 2>/dev/null
-    
-    if [ ${PIPESTATUS[0]} -ne 0 ]; then
-        echo "ERROR: Failed to download or parse ${NAME} from server repository node!"
-    else
-        echo "Successfully downloaded and unpacked ${NAME} into position."
-    fi
+    curl -fsSL "$URL" | tar -xz -C "$TARGET_PATH" --strip-components=1
+    echo "Successfully downloaded and unpacked ${NAME} into position."
     echo "--------------------------------------------------------"
 done
 
@@ -77,3 +70,33 @@ else
     echo "Installed ${HEADER_COUNT} Generated headers and provider sources into ${DEPS_DIR}/Generated/"
 fi
 rm -rf "$OHNG_TMP"
+
+KFR_NAME="kfr"
+KFR_VERSION="7.2.0"
+ARCH=$(uname -m)
+TARGET_PATH="${DEPS_DIR}/${KFR_NAME}"
+
+if [ "$ARCH" = "aarch64" ]; then
+    KFR_ZIP="KFR-${KFR_VERSION}-Linux-ARM64.zip"
+else
+    KFR_ZIP="KFR-${KFR_VERSION}-Linux-ARM.zip"
+fi
+URL="https://github.com/kfrlib/kfr/releases/download/${KFR_VERSION}/${KFR_ZIP}"
+
+if [ ! -d "${TARGET_PATH}/include/kfr" ]; then
+    echo "Downloading prebuilt ${KFR_ZIP} from ${URL}..."
+    TMP_ZIP=$(mktemp /tmp/kfr.XXXXXX.zip)
+    TMP_DIR=$(mktemp -d /tmp/kfr.XXXXXX)
+    curl -fsSL "$URL" -o "$TMP_ZIP"
+    unzip -q "$TMP_ZIP" -d "$TMP_DIR"
+
+    rm -rf "$TARGET_PATH"
+    mkdir -p "$TARGET_PATH"
+    if [ -d "$TMP_DIR/include/kfr" ]; then
+        mv "$TMP_DIR"/* "$TARGET_PATH/"
+    else
+        mv "$TMP_DIR"/*/* "$TARGET_PATH/"
+    fi
+    rm -rf "$TMP_ZIP" "$TMP_DIR"
+    echo "Successfully unpacked ${KFR_NAME} v${KFR_VERSION} into ${TARGET_PATH}."
+fi

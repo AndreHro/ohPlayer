@@ -1,4 +1,3 @@
-/*#include <OpenHome/Av/Tests/TestMediaPlayer.h>*/
 #include "TestMediaPlayer.h"
 #include <OpenHome/Private/OptionParser.h>
 #include <OpenHome/Types.h>
@@ -21,6 +20,7 @@ TestMediaPlayerOptions::TestMediaPlayerOptions()
     , iOptionUserAgent("", "--useragent", Brn(""), "User Agent (for HTTP requests)")
     , iOptionClockPull("", "--clockpull", "Enable clock pulling")
     , iOptionStoreFile("-s", "--storefile", Brn(""), "File for reading/writing persistent store")
+    , iOptionKfrConfigDir("", "--kfr-config-dir", Brn(""), "Directory containing KFR left/right impulse-response WAV files")
     , iOptionOdp("", "--odp", 0, "Port for ODP server")
     , iOptionWebUi("", "--webui", 0, "Port for Web UI server")
     , iOptionShell("", "--shell", 2323, "Port for shell (0 to disable)")
@@ -39,6 +39,7 @@ TestMediaPlayerOptions::TestMediaPlayerOptions()
     iParser.AddOption(&iOptionUserAgent);
     iParser.AddOption(&iOptionClockPull);
     iParser.AddOption(&iOptionStoreFile);
+    iParser.AddOption(&iOptionKfrConfigDir);
     iParser.AddOption(&iOptionOdp);
     iParser.AddOption(&iOptionWebUi);
     iParser.AddOption(&iOptionShell);
@@ -114,6 +115,11 @@ const OptionBool& TestMediaPlayerOptions::ClockPull() const
 const OptionString& TestMediaPlayerOptions::StoreFile() const
 {
     return iOptionStoreFile;
+}
+
+const OptionString& TestMediaPlayerOptions::KfrConfigDir() const
+{
+    return iOptionKfrConfigDir;
 }
 
 const OptionUint& TestMediaPlayerOptions::OptionOdp() const
